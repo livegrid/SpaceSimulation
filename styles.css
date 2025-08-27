@@ -1,0 +1,70 @@
+/* Space Simulation Styles */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: linear-gradient(180deg, #0c0c0c 0%, #1a1a2e 50%, #16213e 100%);
+  font-family: 'Arial', sans-serif;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  color: white;
+}
+
+#canvas-container {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 0 50px rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.8);
+}
+
+canvas {
+  display: block;
+  border-radius: 10px;
+}
+
+/* Responsive design */
+@media (max-width: 900px) {
+  canvas {
+    width: 100vw !important;
+    height: auto !important;
+  }
+}
+
+/* Add some subtle animations */
+@keyframes twinkle {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
+
+canvas {
+  animation: twinkle 4s ease-in-out infinite;
+}
+
+/* Hide scrollbars but keep functionality */
+html {
+  overflow: hidden;
+}
+
+/* Add a subtle grid background effect */
+#canvas-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image:
+    radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.1) 0%, transparent 50%),
+    radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.1) 0%, transparent 50%),
+    radial-gradient(circle at 40% 40%, rgba(120, 219, 255, 0.1) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: -1;
+}
