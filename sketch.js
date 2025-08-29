@@ -6,6 +6,11 @@ let particles = [];
 let numParticles = 100; // Start with fewer particles
 let particleSize = 2;
 
+// Background visual layers
+let bgGradientTime = 0;
+let planetsBg = [];
+let nebulaBlobs = [];
+
 // Debug options
 let showMotionDebug = false; // Toggle motion visualization
 let showBaselineDiff = false; // Show baseline vs current frame difference
@@ -79,10 +84,203 @@ function setup() {
     particles.push(new Particle(width/2, height/2));
   }
 
+  // Initialize background elements
+  initBackgroundElements();
+
   // Initialize motion detection map lazily when video is ready
 }
 
 // Removed background initialization - focusing on particles only
+
+// Initialize background visual elements (planets and nebula blobs)
+function initBackgroundElements() {
+  bgGradientTime = random(1000);
+
+  // Create background planets (large, slow, low-alpha)
+  planetsBg = [];
+  const base = min(width, height);
+  const numPlanets = 3;
+  for (let i = 0; i < numPlanets; i++) {
+    const radius = base * random(0.18, 0.34);
+    const orbitRadius = base * random(0.35, 0.75);
+    const speed = random(0.00006, 0.00018) * (random(1) < 0.5 ? -1 : 1);
+    const angle = random(TAU);
+    const hue = random(200, 320) + i * random(-40, 40);
+    const sat = random(120, 180);
+    const bri = random(110, 180);
+    planetsBg.push({
+      orbitCenter: createVector(width * 0.5 + random(-base * 0.1, base * 0.1), height * 0.5 + random(-base * 0.1, base * 0.1)),
+      orbitRadius,
+      angle,
+      speed,
+      radius,
+      hue,
+      sat,
+      bri,
+      ring: random(1) < 0.6,
+      ringTilt: random(-PI/5, PI/5),
+      ringAlpha: random(30, 70),
+      phase: random(TAU)
+    });
+  }
+
+  // Create nebula blobs
+  nebulaBlobs = [];
+  const numBlobs = 6;
+  for (let i = 0; i < numBlobs; i++) {
+    const r = base * random(0.25, 0.5);
+    nebulaBlobs.push({
+      x: random(width),
+      y: random(height),
+      baseRadius: r,
+      hue: (random(180, 300) + i * 12) % 360,
+      alpha: random(30, 70),
+      driftX: random(-0.08, 0.08),
+      driftY: random(-0.04, 0.04),
+      wobbleSpeed: random(0.0005, 0.0012),
+      wobbleAmp: random(0.04, 0.12)
+    });
+  }
+}
+
+// Completely clears the canvas pixel buffer (avoids cumulative blending artifacts)
+function hardClearCanvas() {
+  push();
+  const ctx = drawingContext;
+  // Reset any transforms before clearing
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  pop();
+}
+
+// Convert p5 color to rgba() string for Canvas gradients
+function colorToRgba(c) {
+  const r = red(c) | 0;
+  const g = green(c) | 0;
+  const b = blue(c) | 0;
+  const a = (alpha(c) / 255).toFixed(3);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// Draw a smooth linear gradient background that evolves over time
+function drawBackgroundGradient() {
+  bgGradientTime += 0.0025;
+  const t = bgGradientTime;
+  const h1 = (220 + 40 * sin(t * 0.6)) % 360;
+  const h2 = (300 + 50 * cos(t * 0.4)) % 360;
+  const c1 = color(h1, 120, 40 + 10 * sin(t * 0.7), 255);
+  const c2 = color(h2, 120, 20 + 8 * cos(t * 0.5), 255);
+
+  push();
+  noStroke();
+  const ctx = drawingContext;
+  // Slowly rotate gradient direction over time
+  const ang = t * 0.15;
+  const rr = max(width, height);
+  const x1 = width * 0.5 + cos(ang) * rr;
+  const y1 = height * 0.5 + sin(ang) * rr;
+  const x2 = width * 0.5 - cos(ang) * rr;
+  const y2 = height * 0.5 - sin(ang) * rr;
+  const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+  grad.addColorStop(0, colorToRgba(c1));
+  grad.addColorStop(1, colorToRgba(c2));
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, width, height);
+  pop();
+}
+
+// Helper: fill a circle with a radial gradient
+function fillCircleRadialGradient(x, y, radius, innerC, outerC, innerOffset = 0.25) {
+  const ctx = drawingContext;
+  const grad = ctx.createRadialGradient(x - radius * 0.25, y - radius * 0.25, radius * innerOffset, x, y, radius);
+  grad.addColorStop(0, colorToRgba(innerC));
+  grad.addColorStop(1, colorToRgba(outerC));
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Draw large, slow-moving background planets
+function drawBackgroundPlanets() {
+  push();
+  noStroke();
+  for (let p of planetsBg) {
+    p.angle += p.speed;
+    const px = p.orbitCenter.x + cos(p.angle) * p.orbitRadius;
+    const py = p.orbitCenter.y + sin(p.angle) * p.orbitRadius;
+
+    // Gentle breathing radius change
+    const t = millis() * 0.001;
+    const breath = 1 + 0.025 * sin(t * 0.4 + p.phase);
+    const pr = p.radius * breath;
+
+    // Planet body with soft highlight
+    const inner = color(p.hue, p.sat, min(255, p.bri + 30), 120);
+    const outer = color(p.hue, p.sat * 0.8, p.bri * 0.5, 90);
+    fillCircleRadialGradient(px, py, pr, inner, outer, 0.15);
+
+    // Subtle atmosphere glow
+    push();
+    stroke(p.hue, p.sat, 220, 30);
+    strokeWeight(4);
+    noFill();
+    circle(px, py, pr * 2.1);
+    pop();
+
+    // Optional ring
+    if (p.ring) {
+      push();
+      translate(px, py);
+      rotate(p.ringTilt + 0.08 * sin(t * 0.3 + p.phase));
+      stroke(p.hue, 80, 220, p.ringAlpha);
+      noFill();
+      strokeWeight(2);
+      ellipse(0, 0, pr * 2.6, pr * 1.1);
+      strokeWeight(1);
+      stroke(p.hue, 60, 180, p.ringAlpha * 0.7);
+      ellipse(0, 0, pr * 2.2, pr * 0.9);
+      pop();
+    }
+  }
+  pop();
+}
+
+// Draw drifting nebula blobs using radial gradients
+function drawNebulaBlobs() {
+  push();
+  for (let b of nebulaBlobs) {
+    // Wobble radius
+    const wobble = 1 + b.wobbleAmp * sin(millis() * b.wobbleSpeed + b.x * 0.01 + b.y * 0.01);
+    const r = b.baseRadius * wobble;
+
+    // Drift plus tiny center swirl to keep it alive
+    const cx = width * 0.5, cy = height * 0.5;
+    const dx = b.x - cx, dy = b.y - cy;
+    const dist = max(1, sqrt(dx * dx + dy * dy));
+    const tx = -dy / dist; // tangential direction (perpendicular)
+    const ty = dx / dist;
+    const swirlSpeed = 0.03; // px/frame
+    b.x += b.driftX + tx * swirlSpeed;
+    b.y += b.driftY + ty * swirlSpeed;
+    if (b.x < -r) b.x = width + r;
+    if (b.x > width + r) b.x = -r;
+    if (b.y < -r) b.y = height + r;
+    if (b.y > height + r) b.y = -r;
+
+    // Multi-layered gradient for depth
+    const inner = color((b.hue + 10) % 360, 180, 200, b.alpha);
+    const mid = color((b.hue + 40) % 360, 140, 120, b.alpha * 0.8);
+    const outer = color((b.hue + 60) % 360, 90, 60, b.alpha * 0.5);
+
+    // Draw three concentric gradients for a richer nebula
+    fillCircleRadialGradient(b.x - r * 0.08, b.y - r * 0.08, r * 0.85, inner, mid, 0.08);
+    fillCircleRadialGradient(b.x, b.y, r, mid, outer, 0.12);
+    fillCircleRadialGradient(b.x + r * 0.05, b.y + r * 0.03, r * 1.15, outer, color((b.hue + 80) % 360, 60, 30, b.alpha * 0.35), 0.2);
+  }
+  pop();
+}
 
 function initializeCamera() {
   
@@ -198,7 +396,7 @@ function draw() {
   if (videoReady && videoCapture) {
     // Scale and draw the camera feed to fit the canvas
     push();
-    tint(255, 255, 255, 30); // Make camera feed barely visible (very low opacity)
+    tint(255, 255, 255, 22); // Keep camera extremely subtle behind visuals
     
     // Calculate scaling to fit camera feed to canvas while maintaining aspect ratio
     let videoAspect = videoCapture.width / videoCapture.height;
@@ -224,7 +422,7 @@ function draw() {
     push();
     translate(drawX + drawWidth, 0);
     scale(-1, 1);
-    image(videoCapture, 0, drawY, drawWidth, drawHeight);
+    // image(videoCapture, 0, drawY, drawWidth, drawHeight);
     pop();
     pop();
   } else {
@@ -232,6 +430,15 @@ function draw() {
     background(0);
   }
   // background(0);
+
+  // Hard clear to fully remove any previous frame content (prevents lingering trails)
+  hardClearCanvas();
+
+  // Dynamic space background layers (always behind particles)
+  blendMode(BLEND); // ensure normal compositing for background paint
+  drawBackgroundGradient();
+  drawBackgroundPlanets();
+  drawNebulaBlobs();
 
   // Throttle baseline adaption to reduce per-frame cost
   if (videoReady && videoCapture && frameCount > 60 && frameCount % 10 === 0) { // ~6 Hz
@@ -268,15 +475,17 @@ function draw() {
   }
 
   // Core particle system
+  push();
+  blendMode(ADD); // Make particles glow over background
   for (let particle of particles) {
     particle.flock(particles);             // Flocking behavior
-    // Optional hotspot attraction disabled for now (pure flocking)
     if (useHotspotAttraction && (frameCount + (particle.pos.x | 0)) % hotspotUpdateModulo === 0) {
       particle.applyHotspotAttractionFast();
     }
     particle.update();
     particle.display();
   }
+  pop();
 
   // Show camera status and instructions
   drawInstructions();
@@ -564,9 +773,9 @@ class Particle {
   }
 
   display() {
-    // Minimal rendering - just a simple colored point
-    stroke(this.hue, 255, 255);
-    strokeWeight(particleSize);
+    // Glowing stardust point (works well with ADD blend mode)
+    stroke(this.hue, 255, 200, 160);
+    strokeWeight(particleSize + 0.3);
     point(this.pos.x, this.pos.y);
   }
 }
@@ -1110,4 +1319,7 @@ function windowResized() {
   for (let i = 0; i < numParticles; i++) {
     particles.push(new Particle(random(width), random(height)));
   }
+
+  // Recreate background elements so sizes follow new viewport
+  initBackgroundElements();
 }
