@@ -1,53 +1,91 @@
-// Space Simulation - p5.js
-// Minimal space environment with webcam preview and audio input/output
+// Cosmic Conductor - Barebones Particle Flocking
+// Optimized particle system focused on performance
 
-let stars = [];
-let planets = [];
-let canvasWidth = 800;
-let canvasHeight = 600;
+// Core particle system
+let particles = [];
+let numParticles = 100; // Start with fewer particles
+let particleSize = 2;
 
-// Webcam and Audio variables
+// Debug options
+let showMotionDebug = false; // Toggle motion visualization
+let showBaselineDiff = false; // Show baseline vs current frame difference
+let useHotspotAttraction = true; // Enable camera hotspots
+
+// Motion detection (adaptive baseline)
+let baselineFrame;
+let diffFrame; // for baseline diff visualization
+let motionThreshold = 200; // initial
+let thresholdScale = 2.0; // multiplier applied live
+let motionMap; // Uint8Array at video resolution
+let motionMapWidth = 0;
+let motionMapHeight = 0;
+let motionCountLast = 0;
+let motionPixels = []; // canvas-sized debug/attraction map (populated by detectMotion)
+let forceFieldRadius = 100;
+let baselineUpdateRate = 0.05; // How much to blend new frame into baseline (0.5% per frame)
+
+// Hotspot attraction parameters
+let hotspotInfluenceRadius = 280; // px - wider grip for smoother capture
+let hotspotAttractionStrength = 0.12; // base spring strength
+let hotspotInnerRadius = 28; // smaller soft core so they stay inside
+let hotspotMaxForce = 0.4; // allow stronger net force before clamp
+let hotspotBlendCount = 3; // consider N nearest hotspots
+let hotspotSwirlStrength = 0.1; // baseline swirl
+let hotspotDamping = 0.08; // damp radial velocity so particles settle, not jitter
+let orbitSwirlBase = 0.22; // swirl strength near center
+let orbitSwirlMin = 0.06; // swirl strength near edge
+let orbitJitter = 0.03; // subtle variation to avoid lockstep
+let hotspotUpdateModulo = 2; // update particle attraction every N frames
+let maxActiveHotspots = 16; // cap hotspots considered globally per frame
+
+// Hotspots prepared per frame for fast lookup
+let activeHotspots = [];
+
+// Motion tracking
+let motionHotspots = []; // Areas of significant frame change
+let hotspotThreshold = 50; // Lower threshold for easier detection
+
+// Motion vectors (temporary direction indicators for fast motion)
+let motionVectors = [];
+let previousMotionPixels = []; // previous frame's motion map (canvas-sized)
+let vectorDecay = 0.90; // how quickly vectors fade
+let vectorLifetime = 24; // frames vectors remain visible
+let vectorGridSize = 60; // cell size for computing coarse flow
+let vectorMinCellCount = 10; // minimum active pixels in cell to consider
+let fastMotionSpeed = 4; // px/frame required to spawn vector
+
+// Webcam
 let videoCapture;
-let audioInput;
-let audioLevel = 0;
-let micEnabled = true;
 let videoReady = false;
 let cameraError = null;
 let cameraPermissionDenied = false;
 
 function setup() {
-  let canvas = createCanvas(canvasWidth, canvasHeight);
+  // Minimal canvas setup for maximum performance
+  pixelDensity(1);
+  frameRate(60); // Higher framerate for smooth flocking
+  let canvas = createCanvas(windowWidth, windowHeight);
+  
+  // Essential optimizations only
   canvas.parent('canvas-container');
+  canvas.canvas.willReadFrequently = true;
+  colorMode(HSB, 360, 255, 255); // HSB for simple color variation
 
-  // Initialize webcam with better error handling
+  // Initialize webcam
   initializeCamera();
 
-  // Initialize audio components (defer mic start until user interaction)
-  try {
-    audioInput = new p5.AudioIn();
-    // do not start yet, wait for gesture
-  } catch (error) {
-    console.error('Audio initialization error:', error);
+  // Create simple particles
+  for (let i = 0; i < numParticles; i++) {
+    particles.push(new Particle(width/2, height/2));
   }
 
-  // Create stars
-  for (let i = 0; i < 200; i++) {
-    stars.push({
-      x: random(width),
-      y: random(height),
-      brightness: random(100, 255),
-      twinkleSpeed: random(0.01, 0.05)
-    });
-  }
-
-  // Create some planets
-  planets.push(new Planet(width * 0.2, height * 0.3, 30, color(255, 165, 0))); // Orange planet
-  planets.push(new Planet(width * 0.8, height * 0.7, 25, color(135, 206, 235))); // Blue planet
-  planets.push(new Planet(width * 0.6, height * 0.2, 20, color(255, 20, 147))); // Pink planet
+  // Initialize motion detection map lazily when video is ready
 }
 
+// Removed background initialization - focusing on particles only
+
 function initializeCamera() {
-  console.log('Initializing camera...');
+  
   
   // Reset camera state
   videoReady = false;
@@ -58,7 +96,7 @@ function initializeCamera() {
     // Check if getUserMedia is available
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       cameraError = 'Camera not supported by this browser';
-      console.error(cameraError);
+      
       return;
     }
 
@@ -71,12 +109,12 @@ function initializeCamera() {
       audio: false
     };
     
-    console.log('Creating video capture with constraints:', constraints);
+    
     
     // First test getUserMedia directly to catch permission errors
     navigator.mediaDevices.getUserMedia(constraints)
       .then(stream => {
-        console.log('getUserMedia success, creating p5 capture');
+        
         
         // Now create p5 capture
         videoCapture = createCapture(constraints, videoSuccess);
@@ -89,17 +127,30 @@ function initializeCamera() {
           videoCapture.elt.autoplay = true;
           
           videoCapture.elt.addEventListener('loadeddata', () => {
-            console.log('Video loaded');
+            
+            // Create baseline and diff frames that MATCH THE VIDEO RESOLUTION
+            baselineFrame = createImage(videoCapture.width, videoCapture.height);
+            diffFrame = createImage(videoCapture.width, videoCapture.height);
+            motionMapWidth = videoCapture.width;
+            motionMapHeight = videoCapture.height;
+            motionMap = new Uint8Array(motionMapWidth * motionMapHeight);
+            // Seed baseline with the first frame to avoid garbage
+            videoCapture.loadPixels();
+            baselineFrame.loadPixels();
+            for (let i = 0; i < baselineFrame.pixels.length; i++) {
+              baselineFrame.pixels[i] = videoCapture.pixels[i] || 0;
+            }
+            baselineFrame.updatePixels();
             videoReady = true;
           });
           
           videoCapture.elt.addEventListener('canplay', () => {
-            console.log('Video can play');
+            
             videoReady = true;
           });
           
           videoCapture.elt.addEventListener('error', (e) => {
-            console.error('Video element error:', e);
+            
             cameraError = 'Video element error';
           });
         }
@@ -108,18 +159,18 @@ function initializeCamera() {
         stream.getTracks().forEach(track => track.stop());
       })
       .catch(error => {
-        console.error('getUserMedia error:', error);
+        
         handleCameraError(error);
       });
       
   } catch (error) {
-    console.error('Camera initialization error:', error);
+    
     cameraError = 'Camera initialization failed: ' + error.message;
   }
 }
 
 function handleCameraError(error) {
-  console.error('Camera access error:', error);
+  
   
   if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
     cameraPermissionDenied = true;
@@ -136,129 +187,148 @@ function handleCameraError(error) {
 }
 
 function videoSuccess(stream) {
-  console.log('Camera access granted successfully:', stream);
+  
   videoReady = true;
   cameraError = null;
   cameraPermissionDenied = false;
 }
 
 function draw() {
-  // Space background
-  background(5, 5, 25);
-
-  // Get audio level from p5.AudioIn (only if mic is enabled)
-  if (micEnabled && audioInput) {
-    audioLevel = audioInput.getLevel();
-  } else {
-    audioLevel = 0;
-  }
-
-  // Draw webcam preview (top-right corner) on canvas
-  drawCameraPreview();
-
-  // Draw audio level indicator
-  drawAudioLevelIndicator();
-
-  // Draw stars with twinkling effect
-  for (let star of stars) {
-    let twinkle = sin(frameCount * star.twinkleSpeed) * 50 + 200;
-    stroke(star.brightness, star.brightness, 255, twinkle);
-    strokeWeight(2);
-    point(star.x, star.y);
-  }
-
-  // Draw planets
-  for (let planet of planets) {
-    planet.display();
-    planet.orbit();
-  }
-
-  // Draw some shooting stars occasionally
-  if (random() < 0.005) {
-    drawShootingStar();
-  }
-
-  // Display instructions
-  fill(255, 255, 255, 150);
-  textAlign(CENTER);
-  textSize(14);
-  text("Space Simulation - Webcam & Audio", width / 2, height - 60);
-  textSize(12);
-  text("Click to add stars & beep | Press 'M' to toggle mic | Press 'R' to retry camera", width / 2, height - 40);
-  text("Speak to see audio levels | Webcam preview in top-right", width / 2, height - 20);
-
-  // Show microphone status
-  let micStatus = micEnabled ? "ON" : "OFF";
-  let micColor = micEnabled ? color(0, 255, 0) : color(255, 0, 0);
-  fill(micColor);
-  text(`Mic: ${micStatus}`, width / 2, height - 10);
-
-  // (Minimal UI - no audio context status line)
-}
-
-function mousePressed() {
-  // Initialize audio after user gesture (required by browsers)
-  if (getAudioContext().state !== 'running') {
-    getAudioContext().resume().then(() => {
-      // Start p5 mic if enabled
-      if (micEnabled && audioInput) {
-        audioInput.start(() => {
-          try { audioInput.disconnect(); } catch (e) {}
-        });
-      }
-    }).catch((error) => {
-      console.error('Failed to resume AudioContext:', error);
-    });
-  }
-
-  // Add a new star where the user clicks
-  stars.push({
-    x: mouseX,
-    y: mouseY,
-    brightness: random(150, 255),
-    twinkleSpeed: random(0.01, 0.05)
-  });
-
-  // Play a simple audio beep
-  playBeep();
-}
-
-function playBeep() {
-  if (getAudioContext().state !== 'running') return;
-  let osc = new p5.Oscillator('sine');
-  osc.freq(440);
-  osc.amp(0);
-  osc.start();
-  osc.amp(0.12, 0.01);
-  setTimeout(() => {
-    osc.amp(0, 0.05);
-    setTimeout(() => { osc.stop(); }, 60);
-  }, 140);
-}
-
-// (No custom mic pipeline or extra constraints needed in the minimal setup)
-
-function keyPressed() {
-  if (key === 'm' || key === 'M') {
-    // Toggle microphone on/off with 'M' key
-    if (micEnabled) {
-      if (audioInput) { audioInput.stop(); }
-      micEnabled = false;
+  // Draw camera feed as background if available
+  if (videoReady && videoCapture) {
+    // Scale and draw the camera feed to fit the canvas
+    push();
+    tint(255, 255, 255, 30); // Make camera feed barely visible (very low opacity)
+    
+    // Calculate scaling to fit camera feed to canvas while maintaining aspect ratio
+    let videoAspect = videoCapture.width / videoCapture.height;
+    let canvasAspect = width / height;
+    
+    let drawWidth, drawHeight, drawX, drawY;
+    
+    if (videoAspect > canvasAspect) {
+      // Video is wider than canvas
+      drawHeight = height;
+      drawWidth = height * videoAspect;
+      drawX = (width - drawWidth) / 2;
+      drawY = 0;
     } else {
-      // Only start if AudioContext is running
-      if (getAudioContext().state === 'running' && audioInput) {
-        audioInput.start(() => {
-          try { audioInput.disconnect(); } catch (e) {}
-        });
-        micEnabled = true;
-      } else {
-        // Click first to initialize audio context
-      }
+      // Video is taller than canvas
+      drawWidth = width;
+      drawHeight = width / videoAspect;
+      drawX = 0;
+      drawY = (height - drawHeight) / 2;
     }
-  } else if (key === 'r' || key === 'R') {
+    
+    // Mirror horizontally by drawing with negative width
+    push();
+    translate(drawX + drawWidth, 0);
+    scale(-1, 1);
+    image(videoCapture, 0, drawY, drawWidth, drawHeight);
+    pop();
+    pop();
+  } else {
+    // Fallback to black background if no camera
+    background(0);
+  }
+  // background(0);
+
+  // Throttle baseline adaption to reduce per-frame cost
+  if (videoReady && videoCapture && frameCount > 60 && frameCount % 10 === 0) { // ~6 Hz
+    updateAdaptiveBaseline();
+  }
+
+  // Process motion detection only when needed (debug or attraction) and throttled
+  if (videoReady && videoCapture && (showMotionDebug || useHotspotAttraction)) {
+    if (frameCount % 4 === 0) { // ~15 Hz
+      detectMotion();
+      calculateMotionHotspots();
+    }
+    // calculateMotionVectors();
+    // Prepare a small, capped hotspot list for this frame (no extra copy chain)
+    activeHotspots = motionHotspots.length > maxActiveHotspots
+      ? motionHotspots.slice(0, maxActiveHotspots)
+      : motionHotspots;
+
+    // Debug logging every 30 frames (about 0.5 second at 60fps)
+    if (frameCount % 30 === 0) {
+      
+    }
+  }
+
+  // Show motion detection debug if enabled
+  if (showMotionDebug) {
+    if (showBaselineDiff) {
+      drawBaselineDifference();
+    } else {
+      drawMotionDebug();
+      drawMotionHotspots();
+      // drawMotionVectors();
+    }
+  }
+
+  // Core particle system
+  for (let particle of particles) {
+    particle.flock(particles);             // Flocking behavior
+    // Optional hotspot attraction disabled for now (pure flocking)
+    if (useHotspotAttraction && (frameCount + (particle.pos.x | 0)) % hotspotUpdateModulo === 0) {
+      particle.applyHotspotAttractionFast();
+    }
+    particle.update();
+    particle.display();
+  }
+
+  // Show camera status and instructions
+  drawInstructions();
+}
+
+// Mouse click to add a particle for testing
+function mousePressed() {
+  particles.push(new Particle(mouseX, mouseY));
+}
+
+// Keyboard controls for debugging
+function keyPressed() {
+  if (key === 'r' || key === 'R') {
     // Retry camera initialization
-    console.log('Retrying camera initialization...');
+    
     retryCamera();
+  } else if (key === 'c' || key === 'C') {
+    // Clear all particles
+    particles = [];
+  } else if (key === ' ') {
+    // Add random particle
+    particles.push(new Particle(random(width), random(height)));
+  } else if (key === 'd' || key === 'D') {
+    // Toggle motion debug visualization
+    showMotionDebug = !showMotionDebug;
+    
+  } else if (key === 'f' || key === 'F') {
+    // Toggle baseline difference view
+    if (showMotionDebug) {
+      showBaselineDiff = !showBaselineDiff;
+      
+    }
+  } else if (key === 'b' || key === 'B') {
+    // Force update baseline frame
+    updateBaselineFrame();
+    
+  } else if (key === '1') {
+    // Slower baseline adaptation
+    baselineUpdateRate = max(0.001, baselineUpdateRate * 0.5);
+    
+  } else if (key === '2') {
+    // Faster baseline adaptation
+    baselineUpdateRate = min(0.02, baselineUpdateRate * 2);
+    
+  } else if (key === '-' || key === '_') {
+    // Raise threshold (less sensitive)
+    thresholdScale = min(5.0, thresholdScale * 1.15);
+  } else if (key === '=' || key === '+') {
+    // Lower threshold (more sensitive)
+    thresholdScale = max(0.2, thresholdScale / 1.15);
+  } else if (key === 'h' || key === 'H') {
+    useHotspotAttraction = !useHotspotAttraction;
   }
 }
 
@@ -284,135 +354,760 @@ function retryCamera() {
   }, 100);
 }
 
-function drawShootingStar() {
-  let x = random(width);
-  let y = random(height / 2);
-  stroke(255, 255, 255, 200);
-  strokeWeight(3);
-  line(x, y, x + 50, y + 50);
-  strokeWeight(1);
-}
+// Minimal, high-performance particle class
+class Particle {
+  constructor(x, y) {
+    this.pos = createVector(x, y);
+    this.vel = createVector(random(-1, 1), random(-1, 1));
+    this.acc = createVector(0, 0);
+    this.maxSpeed = 5;
+    this.maxForce = 0.05;
 
-function drawCameraPreview() {
-  let previewX = width - 160;
-  let previewY = 10;
-  let previewWidth = 160;
-  let previewHeight = 120;
-  
-  if (videoCapture && videoCapture.elt && videoReady && videoCapture.elt.readyState >= 2) {
-    // Camera is working - show video
-    image(videoCapture, previewX, previewY, previewWidth, previewHeight);
-    
-    // Add a border
-    noFill();
-    stroke(0, 255, 0, 150);
-    strokeWeight(2);
-    rect(previewX, previewY, previewWidth, previewHeight);
-    
-    // Camera status indicator
-    fill(0, 255, 0, 200);
-    noStroke();
-    textSize(10);
-    textAlign(RIGHT);
-    text('Camera: ON', width - 10, previewY + previewHeight + 15);
-    
-  } else {
-    // Camera not working - show placeholder with error info
-    noFill();
-    stroke(cameraError ? color(255, 0, 0, 120) : color(200, 200, 255, 120));
-    strokeWeight(2);
-    rect(previewX, previewY, previewWidth, previewHeight);
-    
-    // Error message or loading message
-    fill(cameraError ? color(255, 100, 100, 200) : color(200, 200, 255, 200));
-    noStroke();
-    textSize(9);
-    textAlign(CENTER, CENTER);
-    
-    if (cameraError) {
-      text('Camera Error:', previewX + previewWidth/2, previewY + previewHeight/2 - 10);
-      text(cameraError.substring(0, 40), previewX + previewWidth/2, previewY + previewHeight/2);
-      if (cameraError.length > 40) {
-        text(cameraError.substring(40, 80), previewX + previewWidth/2, previewY + previewHeight/2 + 10);
-      }
-      
-      // Retry button hint
-      textSize(8);
-      text('Press R to retry', previewX + previewWidth/2, previewY + previewHeight/2 + 25);
-    } else {
-      text('Starting webcam...', previewX + previewWidth/2, previewY + previewHeight/2);
-    }
-    
-    // Camera status indicator
-    fill(cameraError ? color(255, 0, 0, 200) : color(255, 255, 0, 200));
-    noStroke();
-    textSize(10);
-    textAlign(RIGHT);
-    text(cameraError ? 'Camera: ERROR' : 'Camera: LOADING', width - 10, previewY + previewHeight + 15);
+    // Fixed flocking parameters for consistency
+    this.separationRadius = 25;
+    this.alignmentRadius = 50;
+    this.cohesionRadius = 50;
+
+    // Simple visual properties
+    this.hue = random(360); // Use HSB for simple color variation
   }
-}
 
-function drawAudioLevelIndicator() {
-  // Audio level bar in bottom left
-  let barWidth = 200;
-  let barHeight = 20;
-  let barX = 20;
-  let barY = height - 60;
+  // Flocking behavior - simplified
+  flock(particles) {
+    let sep = this.separate(particles);
+    let ali = this.align(particles);
+    let coh = this.cohesion(particles);
 
-  // Background bar
-  fill(50, 50, 50, 150);
-  stroke(255, 255, 255, 100);
-  strokeWeight(1);
-  rect(barX, barY, barWidth, barHeight);
+    // Weight the forces
+    sep.mult(1.5);
+    ali.mult(1.0);
+    coh.mult(1.0);
 
-  // Audio level fill
-  let levelWidth = map(audioLevel, 0, 0.3, 0, barWidth); // Map audio level to bar width
-  fill(0, 255, 0, 200);
-  noStroke();
-  rect(barX, barY, levelWidth, barHeight);
+    // Apply forces
+    this.applyForce(sep);
+    this.applyForce(ali);
+    this.applyForce(coh);
+  }
 
-  // Audio level text
-  fill(255, 255, 255, 200);
-  textAlign(LEFT);
-  textSize(12);
-  text(`Audio Level: ${(audioLevel * 1000).toFixed(1)}`, barX, barY - 10);
-}
+  // Separation - steer to avoid crowding local flockmates (subsampled)
+  separate(particles) {
+    let steer = createVector(0, 0);
+    let count = 0;
 
-class Planet {
-  constructor(x, y, radius, col) {
-    this.x = x;
-    this.y = y;
-    this.radius = radius;
-    this.color = col;
-    this.angle = 0;
-    this.orbitRadius = 50;
-    this.orbitSpeed = random(0.005, 0.02);
+    // Sample every 2nd neighbor for performance
+    for (let i = 0; i < particles.length; i += 2) {
+      let other = particles[i];
+      let d = p5.Vector.dist(this.pos, other.pos);
+      if (d > 0 && d < this.separationRadius) {
+        let diff = p5.Vector.sub(this.pos, other.pos);
+        diff.normalize();
+        diff.div(d); // Weight by distance
+        steer.add(diff);
+        count++;
+      }
+    }
+
+    if (count > 0) {
+      steer.div(count);
+    }
+
+    if (steer.mag() > 0) {
+      steer.normalize();
+      steer.mult(this.maxSpeed);
+      steer.sub(this.vel);
+      steer.limit(this.maxForce);
+    }
+
+    return steer;
+  }
+
+  // Alignment - steer towards the average heading of neighbors (subsampled)
+  align(particles) {
+    let sum = createVector(0, 0);
+    let count = 0;
+
+    for (let i = 0; i < particles.length; i += 3) {
+      let other = particles[i];
+      let d = p5.Vector.dist(this.pos, other.pos);
+      if (d > 0 && d < this.alignmentRadius) {
+        sum.add(other.vel);
+        count++;
+      }
+    }
+
+    if (count > 0) {
+      sum.div(count);
+      sum.normalize();
+      sum.mult(this.maxSpeed);
+      let steer = p5.Vector.sub(sum, this.vel);
+      steer.limit(this.maxForce);
+      return steer;
+    }
+
+    return createVector(0, 0);
+  }
+
+  // Cohesion - steer to move toward the average position of neighbors (subsampled)
+  cohesion(particles) {
+    let sum = createVector(0, 0);
+    let count = 0;
+
+    for (let i = 0; i < particles.length; i += 3) {
+      let other = particles[i];
+      let d = p5.Vector.dist(this.pos, other.pos);
+      if (d > 0 && d < this.cohesionRadius) {
+        sum.add(other.pos);
+        count++;
+      }
+    }
+
+    if (count > 0) {
+      sum.div(count);
+      return this.seek(sum);
+    }
+
+    return createVector(0, 0);
+  }
+
+  seek(target) {
+    let desired = p5.Vector.sub(target, this.pos);
+    desired.normalize();
+    desired.mult(this.maxSpeed);
+    let steer = p5.Vector.sub(desired, this.vel);
+    steer.limit(this.maxForce);
+    return steer;
+  }
+
+  // Attraction to motion hotspots (blend of nearest hotspots with soft core)
+  applyHotspotAttractionFast() {
+    if (!activeHotspots || activeHotspots.length === 0) return;
+
+    // Gather nearby hotspots
+    let nearby = [];
+    // Loop through capped, pre-sorted hotspots
+    for (let h of activeHotspots) {
+      // Mirror-aware dx: hotspots are placed in screen coords already mirrored
+      let dx = h.x - this.pos.x;
+      let dy = h.y - this.pos.y;
+      let d = sqrt(dx * dx + dy * dy);
+      if (d <= hotspotInfluenceRadius) {
+        nearby.push({ h, d, dx, dy });
+      }
+    }
+    if (nearby.length === 0) return;
+
+    // Sort by distance; use top N
+    nearby.sort((a, b) => a.d - b.d);
+    let count = hotspotBlendCount < nearby.length ? hotspotBlendCount : nearby.length;
+
+    let totalForce = createVector(0, 0);
+    for (let i = 0; i < count; i++) {
+      let { h, d, dx, dy } = nearby[i];
+      if (d < 1) continue;
+
+      // Radial attraction with soft-core repulsion near the center
+      let dir = createVector(dx / d, dy / d);
+      let intensity = h.intensity || 1;
+
+      // Falloff: smoothstep on (d / R)
+      let t = 1 - d / hotspotInfluenceRadius;
+      if (t < 0) t = 0;
+      let falloff = t * t * (3 - 2 * t); // smoothstep
+
+      // Soft core: repel within inner radius
+      let core = 0;
+      if (d < hotspotInnerRadius) {
+        core = -((hotspotInnerRadius - d) / hotspotInnerRadius);
+      }
+
+      // Swirl: tangential orbit to keep motion lively
+      // Stronger swirl near center, gentle near edge
+      let swirlT = orbitSwirlMin + (orbitSwirlBase - orbitSwirlMin) * falloff;
+      let tangent = createVector(-dir.y, dir.x); // rotate 90 deg
+      tangent.mult((hotspotSwirlStrength + swirlT) * (1 + random(-orbitJitter, orbitJitter)));
+
+      // Stronger radial pull that increases when already inside the hotspot
+      let insideBoost = d < hotspotInfluenceRadius * 0.5 ? 1.4 : 1.0;
+      let radialStrength = hotspotAttractionStrength * falloff * intensity * insideBoost;
+      let radial = p5.Vector.mult(dir, radialStrength + core);
+
+      let force = p5.Vector.add(radial, tangent);
+      totalForce.add(force);
+    }
+
+    // Limit the net hotspot force so flocking still matters
+    // Damp radial component of current velocity to keep graceful motion
+    // Project velocity onto dir and damp that component only (spring-damper feel)
+    let velAlong = p5.Vector.dot(this.vel, totalForce.copy().normalize());
+    if (velAlong > 0) {
+      totalForce.sub(totalForce.copy().normalize().mult(velAlong * hotspotDamping));
+    }
+    if (totalForce.magSq() > hotspotMaxForce * hotspotMaxForce) totalForce.limit(hotspotMaxForce);
+    this.applyForce(totalForce);
+  }
+
+  applyForce(force) {
+    this.acc.add(force);
+  }
+
+  update() {
+    this.vel.add(this.acc);
+    this.vel.limit(this.maxSpeed);
+    this.pos.add(this.vel);
+    this.acc.mult(0);
+
+    // Wrap around edges
+    if (this.pos.x > width) this.pos.x = 0;
+    if (this.pos.x < 0) this.pos.x = width;
+    if (this.pos.y > height) this.pos.y = 0;
+    if (this.pos.y < 0) this.pos.y = height;
   }
 
   display() {
-    // Draw orbit path
+    // Minimal rendering - just a simple colored point
+    stroke(this.hue, 255, 255);
+    strokeWeight(particleSize);
+    point(this.pos.x, this.pos.y);
+  }
+}
+
+// Background functions removed - focusing on particle performance
+
+// Slowly adaptive baseline that adjusts to lighting changes
+function updateAdaptiveBaseline() {
+  if (!videoReady || !videoCapture) return;
+
+  // Ensure frames exist and match the video resolution
+  if (!baselineFrame || baselineFrame.width !== videoCapture.width || baselineFrame.height !== videoCapture.height) {
+    baselineFrame = createImage(videoCapture.width, videoCapture.height);
+    baselineFrame.copy(videoCapture, 0, 0, videoCapture.width, videoCapture.height, 0, 0, videoCapture.width, videoCapture.height);
+  }
+
+  // Ensure frames exist and match the video resolution
+  if (!baselineFrame || baselineFrame.width !== videoCapture.width || baselineFrame.height !== videoCapture.height) {
+    baselineFrame = createImage(videoCapture.width, videoCapture.height);
+    baselineFrame.copy(videoCapture, 0, 0, videoCapture.width, videoCapture.height, 0, 0, videoCapture.width, videoCapture.height);
+  }
+
+  videoCapture.loadPixels();
+  baselineFrame.loadPixels();
+
+  // Blend current frame into baseline very slowly
+  for (let i = 0; i < baselineFrame.pixels.length; i++) {
+    let currentValue = videoCapture.pixels[i];
+    let baselineValue = baselineFrame.pixels[i];
+    
+    // Weighted average: baseline = baseline * (1 - rate) + current * rate
+    baselineFrame.pixels[i] = baselineValue * (1 - baselineUpdateRate) + currentValue * baselineUpdateRate;
+  }
+  
+  baselineFrame.updatePixels();
+}
+
+// Manual baseline update (for B key)
+function updateBaselineFrame() {
+  if (videoReady && videoCapture) {
+    videoCapture.loadPixels();
+    baselineFrame.copy(videoCapture, 0, 0, videoCapture.width, videoCapture.height, 0, 0, videoCapture.width, videoCapture.height);
+    
+
+    // Also reset motion pixels to avoid ghosting
+    if (motionPixels && motionPixels.length) motionPixels.fill(0);
+    motionHotspots = [];
+  }
+}
+
+// Edge-based motion detection - more robust to lighting and auto-exposure
+function detectMotion() {
+  if (!videoReady || !videoCapture) return;
+
+  videoCapture.loadPixels();
+  baselineFrame.loadPixels();
+
+  // Clear motion pixels (canvas-sized debug map)
+  if (!motionPixels || motionPixels.length !== width * height) {
+    motionPixels = new Array(width * height).fill(0);
+  } else {
+    motionPixels.fill(0);
+  }
+
+  let step = 4; // Sample every 4th pixel
+  let totalMotionCount = 0;
+  let sampleCount = 0;
+
+  for (let x = step; x < videoCapture.width - step; x += step) {
+    for (let y = step; y < videoCapture.height - step; y += step) {
+      let index = (x + y * videoCapture.width) * 4;
+
+      // Check if index is valid
+      if (index >= videoCapture.pixels.length) continue;
+
+      // Calculate edge strength for current frame
+      let currEdge = calculateEdgeStrength(videoCapture.pixels, x, y, videoCapture.width);
+      
+      // Calculate edge strength for baseline frame
+      let baseEdge = calculateEdgeStrength(baselineFrame.pixels, x, y, videoCapture.width);
+
+      // Motion is change in edge patterns, not absolute color changes
+      let edgeDiff = abs(currEdge - baseEdge);
+
+      // Also check local texture change (neighboring pixel relationships)
+      let textureChange = calculateTextureChange(videoCapture.pixels, baselineFrame.pixels, x, y, videoCapture.width);
+
+      // Combine edge and texture changes
+      let motionValue = (edgeDiff * 0.7 + textureChange * 0.3);
+
+      // Adaptive threshold based on local contrast
+      let localContrast = calculateLocalContrast(videoCapture.pixels, x, y, videoCapture.width);
+      let adaptiveThreshold = map(localContrast, 0, 100, 5, 25); // Lower threshold for low contrast areas
+
+      // Only register as motion if above adaptive threshold
+      if (motionValue > adaptiveThreshold * thresholdScale) {
+        // Write to canvas-sized debug map (scaled, MIRRORED horizontally)
+        let canvasX = width - 1 - ((x * width / videoCapture.width) | 0);
+        let canvasY = (y * height / videoCapture.height) | 0;
+        let motionIndex = canvasX + canvasY * width;
+        if (motionIndex >= 0 && motionIndex < motionPixels.length) {
+          motionPixels[motionIndex] = motionValue;
+          totalMotionCount++;
+        }
+      }
+
+      sampleCount++;
+    }
+  }
+
+  // Log motion info occasionally
+  if (frameCount % 120 === 0 && sampleCount > 0) { // Every 2 seconds
+    let motionPercentage = (totalMotionCount / sampleCount) * 100;
+    
+  }
+}
+
+// Calculate edge strength using simple gradient
+function calculateEdgeStrength(pixels, x, y, width) {
+  let centerIndex = (x + y * width) * 4;
+  let rightIndex = ((x + 1) + y * width) * 4;
+  let downIndex = (x + (y + 1) * width) * 4;
+
+  if (rightIndex >= pixels.length || downIndex >= pixels.length) return 0;
+
+  // Get grayscale values
+  let centerGray = (pixels[centerIndex] + pixels[centerIndex + 1] + pixels[centerIndex + 2]) / 3;
+  let rightGray = (pixels[rightIndex] + pixels[rightIndex + 1] + pixels[rightIndex + 2]) / 3;
+  let downGray = (pixels[downIndex] + pixels[downIndex + 1] + pixels[downIndex + 2]) / 3;
+
+  // Calculate gradients
+  let gradX = abs(rightGray - centerGray);
+  let gradY = abs(downGray - centerGray);
+
+  return sqrt(gradX * gradX + gradY * gradY);
+}
+
+// Calculate texture change by comparing pixel relationships
+function calculateTextureChange(currPixels, basePixels, x, y, width) {
+  let totalChange = 0;
+  let count = 0;
+
+  // Check 3x3 neighborhood
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      if (dx === 0 && dy === 0) continue;
+
+      let neighborX = x + dx;
+      let neighborY = y + dy;
+
+      if (neighborX >= 0 && neighborX < width && neighborY >= 0) {
+        let centerIndex = (x + y * width) * 4;
+        let neighborIndex = (neighborX + neighborY * width) * 4;
+
+        if (neighborIndex < currPixels.length && centerIndex < currPixels.length) {
+          // Current frame relationship
+          let currCenter = (currPixels[centerIndex] + currPixels[centerIndex + 1] + currPixels[centerIndex + 2]) / 3;
+          let currNeighbor = (currPixels[neighborIndex] + currPixels[neighborIndex + 1] + currPixels[neighborIndex + 2]) / 3;
+          let currRelation = currCenter - currNeighbor;
+
+          // Baseline frame relationship
+          let baseCenter = (basePixels[centerIndex] + basePixels[centerIndex + 1] + basePixels[centerIndex + 2]) / 3;
+          let baseNeighbor = (basePixels[neighborIndex] + basePixels[neighborIndex + 1] + basePixels[neighborIndex + 2]) / 3;
+          let baseRelation = baseCenter - baseNeighbor;
+
+          // Change in relationship
+          totalChange += abs(currRelation - baseRelation);
+          count++;
+        }
+      }
+    }
+  }
+
+  return count > 0 ? totalChange / count : 0;
+}
+
+// Calculate local contrast to adapt threshold
+function calculateLocalContrast(pixels, x, y, width) {
+  let values = [];
+
+  // Sample 3x3 neighborhood
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      let sampleX = x + dx;
+      let sampleY = y + dy;
+
+      if (sampleX >= 0 && sampleX < width && sampleY >= 0) {
+        let index = (sampleX + sampleY * width) * 4;
+        if (index < pixels.length) {
+          let gray = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3;
+          values.push(gray);
+        }
+      }
+    }
+  }
+
+  if (values.length < 2) return 0;
+
+  // Calculate standard deviation as measure of local contrast
+  let mean = values.reduce((sum, val) => sum + val, 0) / values.length;
+  let variance = values.reduce((sum, val) => sum + (val - mean) * (val - mean), 0) / values.length;
+  
+  return sqrt(variance);
+}
+
+// Calculate motion hotspots (areas of significant change)
+// Calculate motion hotspots (areas of significant frame change)
+function calculateMotionHotspots() {
+  motionHotspots = [];
+
+  // Simple approach: find areas with significant motion
+  let minHotspotSize = 5; // Minimum number of motion pixels to form a hotspot
+
+  // Use a grid approach but much simpler
+  let gridSize = 50; // Size of each hotspot area
+
+  for (let gridX = 0; gridX < width; gridX += gridSize) {
+    for (let gridY = 0; gridY < height; gridY += gridSize) {
+
+      let totalMotion = 0;
+      let pixelCount = 0;
+      let maxMotion = 0;
+
+      // Check all pixels in this grid cell
+      for (let x = gridX; x < min(gridX + gridSize, width); x++) {
+        for (let y = gridY; y < min(gridY + gridSize, height); y++) {
+          let index = x + y * width;
+          if (index < motionPixels.length) {
+            let motionValue = motionPixels[index];
+            if (motionValue > 0) {
+              totalMotion += motionValue;
+              pixelCount++;
+              if (motionValue > maxMotion) maxMotion = motionValue;
+            }
+          }
+        }
+      }
+
+      // Create hotspot if there's significant motion
+      if (pixelCount >= minHotspotSize && maxMotion > hotspotThreshold) {
+        let avgMotion = totalMotion / pixelCount;
+        motionHotspots.push({
+          x: gridX + gridSize/2,
+          y: gridY + gridSize/2,
+          intensity: avgMotion,
+          size: pixelCount,
+          maxMotion: maxMotion
+        });
+      }
+    }
+  }
+}
+
+// Calculate motion vectors based on motion shift between consecutive frames
+function calculateMotionVectors() {
+  // Decay existing vectors and remove expired
+  for (let i = motionVectors.length - 1; i >= 0; i--) {
+    let v = motionVectors[i];
+    v.magnitude *= vectorDecay;
+    v.life -= 1;
+    if (v.life <= 0 || v.magnitude < 0.5) motionVectors.splice(i, 1);
+  }
+
+  // Ensure previousMotionPixels exists and is canvas-sized
+  if (!previousMotionPixels.length || previousMotionPixels.length !== width * height) {
+    previousMotionPixels = new Array(width * height).fill(0);
+  }
+
+  // Coarse grid to detect local flow
+  let cols = ceil(width / vectorGridSize);
+  let rows = ceil(height / vectorGridSize);
+  let cellData = new Array(cols * rows).fill(null).map(() => ({
+    x: 0, y: 0, dx: 0, dy: 0, count: 0
+  }));
+
+  // Sample a subset of pixels for efficiency
+  const step = 4;
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      let idx = x + y * width;
+      if (motionPixels[idx] <= motionThreshold) continue;
+
+      // Search small neighborhood in previous map to estimate shift
+      let bestDx = 0, bestDy = 0, bestVal = 0;
+      for (let dy = -8; dy <= 8; dy += 4) {
+        for (let dx = -8; dx <= 8; dx += 4) {
+          let px = x + dx, py = y + dy;
+          if (px < 0 || py < 0 || px >= width || py >= height) continue;
+          let pIdx = px + py * width;
+          let val = previousMotionPixels[pIdx] || 0;
+          if (val > bestVal) { bestVal = val; bestDx = dx; bestDy = dy; }
+        }
+      }
+
+      if (bestVal > motionThreshold) {
+        // Register flow into cell
+        let c = floor(x / vectorGridSize);
+        let r = floor(y / vectorGridSize);
+        let ci = c + r * cols;
+        let cell = cellData[ci];
+        cell.x += x; cell.y += y; cell.dx += -bestDx; cell.dy += -bestDy; // direction where current moved from
+        cell.count++;
+      }
+    }
+  }
+
+  // Convert cells to vectors
+  for (let i = 0; i < cellData.length; i++) {
+    let cell = cellData[i];
+    if (cell.count >= vectorMinCellCount) {
+      let cx = cell.x / cell.count;
+      let cy = cell.y / cell.count;
+      let dx = cell.dx / cell.count;
+      let dy = cell.dy / cell.count;
+      let mag = sqrt(dx * dx + dy * dy);
+      if (mag >= fastMotionSpeed) {
+        motionVectors.push({ x: cx, y: cy, dx, dy, magnitude: mag, life: vectorLifetime });
+      }
+    }
+  }
+
+  // Store current motion map for next frame comparison
+  previousMotionPixels = motionPixels.slice();
+}
+
+// Draw motion vectors as arrows
+function drawMotionVectors() {
+  push();
+  stroke(120, 180, 255, 200);
+  fill(120, 180, 255, 200);
+  strokeWeight(3);
+
+  for (let v of motionVectors) {
+    let len = constrain(v.magnitude, 8, 40);
+    let endX = v.x + (v.dx) * 0.5;
+    let endY = v.y + (v.dy) * 0.5;
+    line(v.x, v.y, endX, endY);
+
+    // Arrow head
+    push();
+    translate(endX, endY);
+    let angle = atan2(v.dy, v.dx);
+    rotate(angle);
+    triangle(0, 0, -8, -4, -8, 4);
+    pop();
+  }
+
+  pop();
+}
+
+
+// Draw motion hotspots as glowing circles
+function drawMotionHotspots() {
+  push();
     noFill();
-    stroke(255, 255, 255, 50);
-    ellipse(this.x, this.y, this.orbitRadius * 2);
 
-    // Draw planet
-    fill(this.color);
+  for (let hotspot of motionHotspots) {
+    let alpha = map(hotspot.intensity, hotspotThreshold, 200, 40, 200);
+    let size = map(hotspot.size, 1, 40, 18, 80);
+
+    // Attraction radius preview (thin ring)
+    stroke(120, 200, 120, 40);
+    strokeWeight(1);
+    circle(hotspot.x, hotspot.y, hotspotInfluenceRadius * 2);
+
+    // Pulsing green core
+    stroke(120, 255, 120, alpha);
+    strokeWeight(3);
+    circle(hotspot.x, hotspot.y, size + sin(millis() * 0.01) * 10);
+
+    // Inner dot
+    fill(120, 255, 120, alpha);
     noStroke();
-    let px = this.x + cos(this.angle) * this.orbitRadius;
-    let py = this.y + sin(this.angle) * this.orbitRadius;
-    ellipse(px, py, this.radius);
-
-    // Add some atmosphere effect
-    fill(red(this.color), green(this.color), blue(this.color), 100);
-    ellipse(px, py, this.radius * 1.5);
+    circle(hotspot.x, hotspot.y, 8);
   }
 
-  orbit() {
-    this.angle += this.orbitSpeed;
+  pop();
+}
+
+
+
+// Draw baseline vs current frame difference for debugging - FIXED coordinate mapping
+function drawBaselineDifference() {
+  if (!videoReady || !videoCapture) return;
+
+  // Make sure pixels are loaded
+  videoCapture.loadPixels();
+  baselineFrame.loadPixels();
+  loadPixels();
+
+  // Clear the canvas first
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = 0;     // R
+    pixels[i + 1] = 0; // G
+    pixels[i + 2] = 0; // B
+    pixels[i + 3] = 255; // Alpha
   }
+
+  // Sample directly from video resolution to avoid coordinate issues
+  let stepX = max(1, floor(videoCapture.width / 200)); // Sample ~200 points horizontally
+  let stepY = max(1, floor(videoCapture.height / 150)); // Sample ~150 points vertically
+
+  for (let videoX = 0; videoX < videoCapture.width; videoX += stepX) {
+    for (let videoY = 0; videoY < videoCapture.height; videoY += stepY) {
+      let videoIndex = (videoX + videoY * videoCapture.width) * 4;
+
+      // Check bounds
+      if (videoIndex >= 0 && videoIndex + 2 < videoCapture.pixels.length && 
+          videoIndex + 2 < baselineFrame.pixels.length) {
+        
+        // Get current and baseline colors
+        let currR = videoCapture.pixels[videoIndex];
+        let currG = videoCapture.pixels[videoIndex + 1];
+        let currB = videoCapture.pixels[videoIndex + 2];
+
+        let baseR = baselineFrame.pixels[videoIndex];
+        let baseG = baselineFrame.pixels[videoIndex + 1];
+        let baseB = baselineFrame.pixels[videoIndex + 2];
+
+        // Calculate difference
+        let diff = abs(currR - baseR) + abs(currG - baseG) + abs(currB - baseB);
+
+        // Map to canvas coordinates
+        let canvasX = floor(videoX * (width / videoCapture.width));
+        let canvasY = floor(videoY * (height / videoCapture.height));
+
+        // Ensure canvas coordinates are valid
+        if (canvasX >= 0 && canvasX < width && canvasY >= 0 && canvasY < height) {
+          // Draw difference as grayscale (brighter = more difference)
+          let brightness = constrain(diff, 0, 255);
+          let pixelIndex = (canvasX + canvasY * width) * 4;
+
+          if (pixelIndex >= 0 && pixelIndex + 2 < pixels.length) {
+            pixels[pixelIndex] = brightness;     // R
+            pixels[pixelIndex + 1] = brightness; // G
+            pixels[pixelIndex + 2] = brightness; // B
+            pixels[pixelIndex + 3] = 200;        // Alpha
+
+            // Fill in some neighboring pixels for better visibility
+            for (let dx = 0; dx < 3 && canvasX + dx < width; dx++) {
+              for (let dy = 0; dy < 3 && canvasY + dy < height; dy++) {
+                let fillIndex = ((canvasX + dx) + (canvasY + dy) * width) * 4;
+                if (fillIndex >= 0 && fillIndex + 2 < pixels.length) {
+                  pixels[fillIndex] = brightness;
+                  pixels[fillIndex + 1] = brightness;
+                  pixels[fillIndex + 2] = brightness;
+                  pixels[fillIndex + 3] = 150;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  updatePixels();
+}
+
+// Draw motion as colored pixels in background for debugging
+function drawMotionDebug() {
+  loadPixels();
+
+  for (let i = 0; i < motionPixels.length; i++) {
+    if (motionPixels[i] > motionThreshold) {
+      let x = i % width;
+      let y = floor(i / width);
+      let pixelIndex = (x + y * width) * 4;
+
+      // Draw motion as red pixels
+      pixels[pixelIndex] = 255;     // R
+      pixels[pixelIndex + 1] = 0;   // G
+      pixels[pixelIndex + 2] = 0;   // B
+      pixels[pixelIndex + 3] = 120; // Alpha
+    }
+  }
+
+  updatePixels();
+}
+
+
+
+
+
+// Instructions with camera status
+function drawInstructions() {
+  push();
+  textAlign(LEFT);
+  textSize(12);
+  
+  // Camera status
+  fill(255);
+  if (videoReady && videoCapture) {
+    fill(0, 255, 0); // Green for camera working
+    text("📹 Camera: ACTIVE", 10, 25);
+    fill(255);
+    text(`Video: ${videoCapture.width}x${videoCapture.height}`, 10, 45);
+  } else if (cameraError) {
+    fill(255, 0, 0); // Red for error
+    text("📹 Camera: ERROR - " + cameraError, 10, 25);
+  } else {
+    fill(255, 255, 0); // Yellow for loading
+    text("📹 Camera: LOADING...", 10, 25);
+  }
+  
+  // Controls
+  fill(255);
+  textAlign(CENTER);
+  text("Controls: D debug • F diff • B baseline • 1/2 baseline speed • +/- sensitivity • H hotspot • C clear • R retry cam", width / 2, height - 20);
+  
+  // Performance info and motion stats
+  textAlign(RIGHT);
+  fill(200);
+  text(`FPS: ${nf(frameRate(), 0, 1)} | Particles: ${particles.length}`, width - 10, 25);
+      if (showMotionDebug) {
+      fill(120, 255, 120);
+      let debugMode = showBaselineDiff ? "BASELINE DIFF" : "MOTION PIXELS";
+      text(`${debugMode} | Hotspots: ${motionHotspots.length}`, width - 10, 45);
+      fill(200);
+      text(`Baseline rate: ${(baselineUpdateRate * 1000).toFixed(1)}/1000`, width - 10, 65);
+      if (showBaselineDiff) {
+        text("⚫ Grayscale: Frame difference | 🟢 Green: Hotspots", width - 10, 85);
+      } else {
+        text("🔴 Red: Motion pixels | 🟢 Green: Hotspots", width - 10, 85);
+      }
+    }
+  
+  pop();
 }
 
 // Handle window resizing
 function windowResized() {
-  resizeCanvas(canvasWidth, canvasHeight);
+  resizeCanvas(windowWidth, windowHeight);
+
+  // Reinitialize motion detection
+  // Do NOT recreate baselineFrame here (keep video resolution). Just clear motion buffer.
+  motionPixels = new Array(width * height).fill(0);
+
+  // Reset particles to new canvas size
+  particles = [];
+  for (let i = 0; i < numParticles; i++) {
+    particles.push(new Particle(random(width), random(height)));
+  }
 }
