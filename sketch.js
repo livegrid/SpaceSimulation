@@ -49,6 +49,50 @@ let activeHotspots = [];
 // Motion tracking
 let motionHotspots = []; // Areas of significant frame change
 let hotspotThreshold = 50; // Lower threshold for easier detection
+let motionGridSize = 60; // grid size for hotspot aggregation (lower = more cells)
+let minHotspotSize = 5; // Minimum number of motion pixels to form a hotspot
+
+// Detection throttling (debug vs attraction)
+let detectionIntervalDebug = 4;     // frames between detections when debug ON (~15 Hz)
+let detectionIntervalHotspot = 10;  // when only attraction is ON (~6 Hz)
+let detectionStepDebug = 4;         // pixel sampling step in debug
+let detectionStepHotspot = 6;       // coarser sampling when only attraction
+
+// Reusable hotspot grid buffers (to reduce GC churn)
+let hotspotGridCols = 0;
+let hotspotGridRows = 0;
+let cellTotalMotionF32 = null; // Float32Array
+let cellPixelCountU16 = null;  // Uint16Array
+let cellMaxMotionF32 = null;   // Float32Array
+
+function ensureHotspotGrid() {
+  const gridSize = motionGridSize;
+  const cols = Math.ceil(width / gridSize);
+  const rows = Math.ceil(height / gridSize);
+  if (cols !== hotspotGridCols || rows !== hotspotGridRows || !cellTotalMotionF32) {
+    hotspotGridCols = cols;
+    hotspotGridRows = rows;
+    cellTotalMotionF32 = new Float32Array(cols * rows);
+    cellPixelCountU16 = new Uint16Array(cols * rows);
+    cellMaxMotionF32 = new Float32Array(cols * rows);
+  } else {
+    cellTotalMotionF32.fill(0);
+    cellPixelCountU16.fill(0);
+    cellMaxMotionF32.fill(0);
+  }
+}
+
+function cleanupAfterDebug() {
+  // Clear heavy debug buffers to help GC and restore performance
+  if (motionPixels && motionPixels.length) motionPixels.fill(0);
+  previousMotionPixels = [];
+  motionVectors = [];
+  // Keep hotspots if attraction is enabled; otherwise clear
+  if (!useHotspotAttraction) {
+    motionHotspots = [];
+    activeHotspots = [];
+  }
+}
 
 // Motion vectors (temporary direction indicators for fast motion)
 let motionVectors = [];
@@ -437,8 +481,10 @@ function draw() {
   // Dynamic space background layers (always behind particles)
   blendMode(BLEND); // ensure normal compositing for background paint
   drawBackgroundGradient();
-  drawBackgroundPlanets();
-  drawNebulaBlobs();
+  if (!showMotionDebug) {
+    drawBackgroundPlanets();
+    drawNebulaBlobs();
+  }
 
   // Throttle baseline adaption to reduce per-frame cost
   if (videoReady && videoCapture && frameCount > 60 && frameCount % 10 === 0) { // ~6 Hz
@@ -447,15 +493,12 @@ function draw() {
 
   // Process motion detection only when needed (debug or attraction) and throttled
   if (videoReady && videoCapture && (showMotionDebug || useHotspotAttraction)) {
-    if (frameCount % 4 === 0) { // ~15 Hz
-      detectMotion();
-      calculateMotionHotspots();
+    const detectEvery = showMotionDebug ? detectionIntervalDebug : detectionIntervalHotspot;
+    const sampleStep = showMotionDebug ? detectionStepDebug : detectionStepHotspot;
+    if (frameCount % detectEvery === 0) {
+      detectMotion(sampleStep);
     }
     // calculateMotionVectors();
-    // Prepare a small, capped hotspot list for this frame (no extra copy chain)
-    activeHotspots = motionHotspots.length > maxActiveHotspots
-      ? motionHotspots.slice(0, maxActiveHotspots)
-      : motionHotspots;
 
     // Debug logging every 30 frames (about 0.5 second at 60fps)
     if (frameCount % 30 === 0) {
@@ -466,9 +509,9 @@ function draw() {
   // Show motion detection debug if enabled
   if (showMotionDebug) {
     if (showBaselineDiff) {
-      drawBaselineDifference();
+      if (frameCount % 4 === 0) drawBaselineDifference();
     } else {
-      drawMotionDebug();
+      if (frameCount % 4 === 0) drawMotionDebug();
       drawMotionHotspots();
       // drawMotionVectors();
     }
@@ -511,7 +554,9 @@ function keyPressed() {
   } else if (key === 'd' || key === 'D') {
     // Toggle motion debug visualization
     showMotionDebug = !showMotionDebug;
-    
+    if (!showMotionDebug) {
+      cleanupAfterDebug();
+    }
   } else if (key === 'f' || key === 'F') {
     // Toggle baseline difference view
     if (showMotionDebug) {
@@ -827,7 +872,7 @@ function updateBaselineFrame() {
 }
 
 // Edge-based motion detection - more robust to lighting and auto-exposure
-function detectMotion() {
+function detectMotion(stepOverride) {
   if (!videoReady || !videoCapture) return;
 
   videoCapture.loadPixels();
@@ -840,9 +885,15 @@ function detectMotion() {
     motionPixels.fill(0);
   }
 
-  let step = 4; // Sample every 4th pixel
+  let step = stepOverride || 4; // sampling step
   let totalMotionCount = 0;
   let sampleCount = 0;
+
+  // Prepare reusable hotspot aggregation grid
+  ensureHotspotGrid();
+  const gridSize = motionGridSize;
+  const cols = hotspotGridCols;
+  const rows = hotspotGridRows;
 
   for (let x = step; x < videoCapture.width - step; x += step) {
     for (let y = step; y < videoCapture.height - step; y += step) {
@@ -879,6 +930,14 @@ function detectMotion() {
         if (motionIndex >= 0 && motionIndex < motionPixels.length) {
           motionPixels[motionIndex] = motionValue;
           totalMotionCount++;
+
+          // Aggregate into grid cell
+          const c = Math.floor(canvasX / gridSize);
+          const r = Math.floor(canvasY / gridSize);
+          const ci = c + r * cols;
+          cellTotalMotionF32[ci] += motionValue;
+          cellPixelCountU16[ci]++;
+          if (motionValue > cellMaxMotionF32[ci]) cellMaxMotionF32[ci] = motionValue;
         }
       }
 
@@ -891,6 +950,31 @@ function detectMotion() {
     let motionPercentage = (totalMotionCount / sampleCount) * 100;
     
   }
+
+  // Build hotspot list from aggregated grid (single pass)
+  const hotspots = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const ci = c + r * cols;
+      const count = cellPixelCountU16[ci];
+      const maxM = cellMaxMotionF32[ci];
+      if (count >= minHotspotSize && maxM > hotspotThreshold) {
+        const avgMotion = cellTotalMotionF32[ci] / count;
+        hotspots.push({
+          x: c * gridSize + gridSize / 2,
+          y: r * gridSize + gridSize / 2,
+          intensity: avgMotion,
+          size: count,
+          maxMotion: maxM
+        });
+      }
+    }
+  }
+
+  // Prefer stronger hotspots first
+  hotspots.sort((a, b) => b.intensity - a.intensity);
+  motionHotspots = hotspots;
+  activeHotspots = hotspots.length > maxActiveHotspots ? hotspots.slice(0, maxActiveHotspots) : hotspots;
 }
 
 // Calculate edge strength using simple gradient
@@ -1149,7 +1233,7 @@ function drawMotionHotspots() {
     // Inner dot
     fill(120, 255, 120, alpha);
     noStroke();
-    circle(hotspot.x, hotspot.y, 8);
+    circle(hotspot.x, hotspot.y, 2);
   }
 
   pop();
