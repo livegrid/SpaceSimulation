@@ -140,10 +140,10 @@ function setup() {
 function initBackgroundElements() {
   bgGradientTime = random(1000);
 
-  // Create background planets (large, slow, low-alpha)
+  // Create background planets (large, slow, low-alpha) - ensure 2-3 planets, no rings
   planetsBg = [];
   const base = min(width, height);
-  const numPlanets = 3;
+  const numPlanets = Math.floor(random(2, 4)); // Ensure 2-3 planets
   for (let i = 0; i < numPlanets; i++) {
     const radius = base * random(0.18, 0.34);
     const orbitRadius = base * random(0.35, 0.75);
@@ -161,7 +161,7 @@ function initBackgroundElements() {
       hue,
       sat,
       bri,
-      ring: random(1) < 0.6,
+      ring: true, // Always have rings for visual interest
       ringTilt: random(-PI/5, PI/5),
       ringAlpha: random(30, 70),
       phase: random(TAU)
@@ -273,7 +273,7 @@ function drawBackgroundPlanets() {
     circle(px, py, pr * 2.1);
     pop();
 
-    // Optional ring
+    // Planet rings - always draw rings for visual interest
     if (p.ring) {
       push();
       translate(px, py);
@@ -818,10 +818,22 @@ class Particle {
   }
 
   display() {
-    // Glowing stardust point (works well with ADD blend mode)
-    stroke(this.hue, 255, 200, 160);
-    strokeWeight(particleSize + 0.3);
-    point(this.pos.x, this.pos.y);
+    // Triangular particle (works well with ADD blend mode)
+    push();
+    translate(this.pos.x, this.pos.y);
+    
+    // Rotate triangle based on velocity direction for dynamic look
+    let angle = atan2(this.vel.y, this.vel.x);
+    rotate(angle);
+    
+    // Draw glowing triangle
+    fill(this.hue, 255, 200, 120);
+    stroke(this.hue, 255, 255, 180);
+    strokeWeight(1);
+    
+    let size = particleSize * 3; // Make triangles bigger
+    triangle(size, 0, -size/2, -size/2, -size/2, size/2);
+    pop();
   }
 }
 
