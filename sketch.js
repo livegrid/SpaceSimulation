@@ -29,6 +29,47 @@ let motionPixels = []; // canvas-sized debug/attraction map (populated by detect
 let forceFieldRadius = 100;
 let baselineUpdateRate = 0.05; // How much to blend new frame into baseline (0.5% per frame)
 
+// Auto-calibration system
+let isCalibrating = false;
+let calibrationStartTime = 0;
+let calibrationDuration = 8000; // 8 seconds
+let calibrationSamples = [];
+let autoThresholdScale = 2.0;
+let baseMotionLevel = 0;
+let ambientNoiseLevel = 0;
+let lightingStability = 1.0;
+
+// Sensitivity slider and controls
+let sensitivityMode = 'auto'; // 'auto', 'manual'
+let userSensitivity = 0.5; // 0-1 range
+let sensitivitySlider = null;
+let sensitivityUI = null;
+let modeButton = null;
+let statusDiv = null;
+
+// Load user preferences
+function loadUserPreferences() {
+  try {
+    let savedMode = localStorage.getItem('cosmic-sensitivity-mode');
+    let savedValue = localStorage.getItem('cosmic-sensitivity-value');
+    
+    if (savedMode) sensitivityMode = savedMode;
+    if (savedValue) userSensitivity = parseFloat(savedValue);
+  } catch (e) {
+    console.log('Unable to load preferences:', e);
+  }
+}
+
+// Save user preferences
+function saveUserPreferences() {
+  try {
+    localStorage.setItem('cosmic-sensitivity-mode', sensitivityMode);
+    localStorage.setItem('cosmic-sensitivity-value', userSensitivity.toString());
+  } catch (e) {
+    console.log('Unable to save preferences:', e);
+  }
+}
+
 // Hotspot attraction parameters
 let hotspotInfluenceRadius = 280; // px - wider grip for smoother capture
 let hotspotAttractionStrength = 0.12; // base spring strength
@@ -42,6 +83,11 @@ let orbitSwirlMin = 0.06; // swirl strength near edge
 let orbitJitter = 0.03; // subtle variation to avoid lockstep
 let hotspotUpdateModulo = 2; // update particle attraction every N frames
 let maxActiveHotspots = 16; // cap hotspots considered globally per frame
+
+// Speed damping near hotspots to make attraction more visible
+let hotspotSpeedDamping = 0.35; // how much to slow down near hotspots (0=no slowdown, 1=full stop)
+let hotspotDampingRadius = 180; // radius within which to apply speed damping
+let hotspotCoreSpeedLimit = 1.5; // maximum speed when very close to hotspot center
 
 // Hotspots prepared per frame for fast lookup
 let activeHotspots = [];
@@ -130,6 +176,12 @@ function setup() {
 
   // Initialize background elements
   initBackgroundElements();
+
+  // Load user preferences
+  loadUserPreferences();
+
+  // Create sensitivity UI
+  createSensitivityUI();
 
   // Initialize motion detection map lazily when video is ready
 }
@@ -433,6 +485,9 @@ function videoSuccess(stream) {
   videoReady = true;
   cameraError = null;
   cameraPermissionDenied = false;
+  
+  // Start auto-calibration when camera is ready
+  startAutoCalibration();
 }
 
 function draw() {
@@ -491,8 +546,14 @@ function draw() {
     updateAdaptiveBaseline();
   }
 
+  // Update auto-calibration if running
+  if (isCalibrating) {
+    updateAutoCalibration();
+    updateSensitivityDisplay(); // Update UI during calibration
+  }
+
   // Process motion detection only when needed (debug or attraction) and throttled
-  if (videoReady && videoCapture && (showMotionDebug || useHotspotAttraction)) {
+  if (videoReady && videoCapture && (showMotionDebug || useHotspotAttraction || isCalibrating)) {
     const detectEvery = showMotionDebug ? detectionIntervalDebug : detectionIntervalHotspot;
     const sampleStep = showMotionDebug ? detectionStepDebug : detectionStepHotspot;
     if (frameCount % detectEvery === 0) {
@@ -583,6 +644,26 @@ function keyPressed() {
     thresholdScale = max(0.2, thresholdScale / 1.15);
   } else if (key === 'h' || key === 'H') {
     useHotspotAttraction = !useHotspotAttraction;
+  } else if (key === 'a' || key === 'A') {
+    // Toggle between auto and manual sensitivity
+    sensitivityMode = sensitivityMode === 'auto' ? 'manual' : 'auto';
+    saveUserPreferences();
+    updateSensitivityDisplay();
+  } else if (key === 's' || key === 'S') {
+    // Toggle sensitivity UI visibility
+    toggleSensitivityUI();
+  } else if (key === 'q' || key === 'Q') {
+    // Decrease hotspot speed damping (less slowdown)
+    hotspotSpeedDamping = max(0, hotspotSpeedDamping - 0.05);
+    console.log(`Hotspot speed damping: ${hotspotSpeedDamping.toFixed(2)}`);
+  } else if (key === 'w' || key === 'W') {
+    // Increase hotspot speed damping (more slowdown)
+    hotspotSpeedDamping = min(0.8, hotspotSpeedDamping + 0.05);
+    console.log(`Hotspot speed damping: ${hotspotSpeedDamping.toFixed(2)}`);
+  } else if (key === 'e' || key === 'E') {
+    // Adjust core speed limit
+    hotspotCoreSpeedLimit = hotspotCoreSpeedLimit > 1 ? max(0.5, hotspotCoreSpeedLimit - 0.2) : min(3, hotspotCoreSpeedLimit + 0.2);
+    console.log(`Hotspot core speed limit: ${hotspotCoreSpeedLimit.toFixed(1)}`);
   }
 }
 
@@ -800,12 +881,62 @@ class Particle {
     this.applyForce(totalForce);
   }
 
+  // Apply speed damping when near hotspots to make attraction more visible
+  applyHotspotSpeedDamping() {
+    if (!useHotspotAttraction || !activeHotspots || activeHotspots.length === 0) return;
+    
+    let totalDamping = 0;
+    let closestDistance = Infinity;
+    
+    // Check distance to all active hotspots
+    for (let h of activeHotspots) {
+      let dx = h.x - this.pos.x;
+      let dy = h.y - this.pos.y;
+      let distance = sqrt(dx * dx + dy * dy);
+      
+      if (distance < hotspotDampingRadius) {
+        // Calculate damping based on distance (closer = more damping)
+        let dampingFactor = 1 - (distance / hotspotDampingRadius);
+        dampingFactor = dampingFactor * dampingFactor; // Quadratic falloff
+        
+        // Weight by hotspot intensity
+        let intensity = h.intensity || 1;
+        let normalizedIntensity = min(intensity / 100, 1.5); // normalize and cap
+        
+        totalDamping += dampingFactor * normalizedIntensity;
+        closestDistance = min(closestDistance, distance);
+      }
+    }
+    
+    if (totalDamping > 0) {
+      // Cap total damping to prevent particles from stopping completely
+      totalDamping = min(totalDamping, hotspotSpeedDamping);
+      
+      // Apply damping to velocity
+      let dampingMultiplier = 1 - totalDamping;
+      this.vel.mult(dampingMultiplier);
+      
+      // Extra speed limiting when very close to hotspot centers
+      if (closestDistance < hotspotInnerRadius * 2) {
+        let currentSpeed = this.vel.mag();
+        if (currentSpeed > hotspotCoreSpeedLimit) {
+          this.vel.normalize();
+          this.vel.mult(hotspotCoreSpeedLimit);
+        }
+      }
+    }
+  }
+
   applyForce(force) {
     this.acc.add(force);
   }
 
   update() {
     this.vel.add(this.acc);
+    
+    // Apply hotspot speed damping before limiting speed
+    this.applyHotspotSpeedDamping();
+    
     this.vel.limit(this.maxSpeed);
     this.pos.add(this.vel);
     this.acc.mult(0);
@@ -1380,26 +1511,278 @@ function drawInstructions() {
   // Controls
   fill(255);
   textAlign(CENTER);
-  text("Controls: D debug • F diff • B baseline • 1/2 baseline speed • +/- sensitivity • H hotspot • C clear • R retry cam", width / 2, height - 20);
+  text("Controls: D debug • F diff • B baseline • 1/2 baseline speed • +/- sensitivity • H hotspot • Q/W damping • E core speed • A auto/manual • S show/hide UI • C clear • R retry cam", width / 2, height - 20);
   
   // Performance info and motion stats
   textAlign(RIGHT);
   fill(200);
   text(`FPS: ${nf(frameRate(), 0, 1)} | Particles: ${particles.length}`, width - 10, 25);
-      if (showMotionDebug) {
-      fill(120, 255, 120);
-      let debugMode = showBaselineDiff ? "BASELINE DIFF" : "MOTION PIXELS";
-      text(`${debugMode} | Hotspots: ${motionHotspots.length}`, width - 10, 45);
-      fill(200);
-      text(`Baseline rate: ${(baselineUpdateRate * 1000).toFixed(1)}/1000`, width - 10, 65);
-      if (showBaselineDiff) {
-        text("⚫ Grayscale: Frame difference | 🟢 Green: Hotspots", width - 10, 85);
-      } else {
-        text("🔴 Red: Motion pixels | 🟢 Green: Hotspots", width - 10, 85);
-      }
+  
+  // Auto-calibration status
+  if (isCalibrating) {
+    fill(255, 255, 0);
+    let progress = ((millis() - calibrationStartTime) / calibrationDuration * 100).toFixed(0);
+    text(`🎯 Auto-calibrating... ${progress}%`, width - 10, 45);
+  } else if (sensitivityMode === 'auto') {
+    fill(0, 255, 0);
+    text(`🤖 Auto-sensitivity: ${autoThresholdScale.toFixed(2)}`, width - 10, 45);
+  } else {
+    fill(255, 165, 0);
+    text(`👤 Manual sensitivity: ${thresholdScale.toFixed(2)}`, width - 10, 45);
+  }
+  
+  if (showMotionDebug) {
+    fill(120, 255, 120);
+    let debugMode = showBaselineDiff ? "BASELINE DIFF" : "MOTION PIXELS";
+    text(`${debugMode} | Hotspots: ${motionHotspots.length}`, width - 10, 65);
+    fill(200);
+    text(`Baseline rate: ${(baselineUpdateRate * 1000).toFixed(1)}/1000`, width - 10, 85);
+    text(`Speed damping: ${(hotspotSpeedDamping * 100).toFixed(0)}% | Core limit: ${hotspotCoreSpeedLimit.toFixed(1)}`, width - 10, 105);
+    if (showBaselineDiff) {
+      text("⚫ Grayscale: Frame difference | 🟢 Green: Hotspots", width - 10, 125);
+    } else {
+      text("🔴 Red: Motion pixels | 🟢 Green: Hotspots", width - 10, 125);
     }
+  }
   
   pop();
+}
+
+// Auto-calibration system
+function startAutoCalibration() {
+  if (!videoReady) return;
+  
+  isCalibrating = true;
+  calibrationStartTime = millis();
+  calibrationSamples = [];
+  console.log('🎯 Starting auto-calibration...');
+}
+
+function updateAutoCalibration() {
+  if (!isCalibrating || !videoReady) return;
+  
+  let elapsed = millis() - calibrationStartTime;
+  
+  if (elapsed > calibrationDuration) {
+    // Calibration complete - analyze samples
+    finishAutoCalibration();
+    return;
+  }
+  
+  // Collect samples during calibration
+  if (frameCount % 10 === 0) { // Sample every 10 frames
+    let sample = {
+      motionLevel: getOverallMotionLevel(),
+      contrast: getAverageContrast(),
+      noiseLevel: getNoiseLevel(),
+      time: elapsed
+    };
+    calibrationSamples.push(sample);
+  }
+}
+
+function finishAutoCalibration() {
+  isCalibrating = false;
+  
+  if (calibrationSamples.length < 5) {
+    console.log('⚠️ Insufficient calibration data, using defaults');
+    return;
+  }
+  
+  // Analyze collected samples
+  let avgMotion = calibrationSamples.reduce((sum, s) => sum + s.motionLevel, 0) / calibrationSamples.length;
+  let avgContrast = calibrationSamples.reduce((sum, s) => sum + s.contrast, 0) / calibrationSamples.length;
+  let avgNoise = calibrationSamples.reduce((sum, s) => sum + s.noiseLevel, 0) / calibrationSamples.length;
+  
+  // Determine environment type and optimal sensitivity
+  baseMotionLevel = avgMotion;
+  ambientNoiseLevel = avgNoise;
+  lightingStability = avgContrast / 100; // normalize
+  
+  // Calculate optimal threshold scale
+  if (avgMotion < 5 && avgNoise < 10) {
+    // Very quiet environment - higher sensitivity
+    autoThresholdScale = 0.8;
+  } else if (avgMotion > 50 || avgNoise > 30) {
+    // Very active/noisy environment - lower sensitivity
+    autoThresholdScale = 3.5;
+  } else if (avgContrast < 20) {
+    // Low contrast/poor lighting - adjust sensitivity
+    autoThresholdScale = 1.2;
+  } else {
+    // Normal environment
+    autoThresholdScale = 2.0;
+  }
+  
+  // Apply auto-calibration if in auto mode
+  if (sensitivityMode === 'auto') {
+    thresholdScale = autoThresholdScale;
+  }
+  
+  console.log(`✅ Auto-calibration complete! Environment: Motion=${avgMotion.toFixed(1)}, Contrast=${avgContrast.toFixed(1)}, Noise=${avgNoise.toFixed(1)}`);
+  console.log(`🎯 Recommended sensitivity: ${autoThresholdScale.toFixed(2)}`);
+}
+
+function getOverallMotionLevel() {
+  if (!motionPixels || motionPixels.length === 0) return 0;
+  
+  let motionCount = 0;
+  let totalMotion = 0;
+  
+  for (let i = 0; i < motionPixels.length; i += 10) { // Sample subset
+    if (motionPixels[i] > 0) {
+      motionCount++;
+      totalMotion += motionPixels[i];
+    }
+  }
+  
+  return motionCount > 0 ? totalMotion / motionCount : 0;
+}
+
+function getAverageContrast() {
+  if (!videoCapture || !videoReady) return 50;
+  
+  videoCapture.loadPixels();
+  let contrastSum = 0;
+  let samples = 0;
+  
+  // Sample contrast from various points
+  for (let x = 10; x < videoCapture.width - 10; x += 20) {
+    for (let y = 10; y < videoCapture.height - 10; y += 20) {
+      let contrast = calculateLocalContrast(videoCapture.pixels, x, y, videoCapture.width);
+      contrastSum += contrast;
+      samples++;
+    }
+  }
+  
+  return samples > 0 ? contrastSum / samples : 50;
+}
+
+function getNoiseLevel() {
+  if (!videoCapture || !baselineFrame || !videoReady) return 0;
+  
+  videoCapture.loadPixels();
+  baselineFrame.loadPixels();
+  
+  let noiseSum = 0;
+  let samples = 0;
+  
+  // Sample noise from stable areas (areas with low motion)
+  for (let x = 0; x < videoCapture.width; x += 15) {
+    for (let y = 0; y < videoCapture.height; y += 15) {
+      let index = (x + y * videoCapture.width) * 4;
+      if (index + 2 < videoCapture.pixels.length && index + 2 < baselineFrame.pixels.length) {
+        let currGray = (videoCapture.pixels[index] + videoCapture.pixels[index + 1] + videoCapture.pixels[index + 2]) / 3;
+        let baseGray = (baselineFrame.pixels[index] + baselineFrame.pixels[index + 1] + baselineFrame.pixels[index + 2]) / 3;
+        let diff = abs(currGray - baseGray);
+        
+        // Only count as noise if it's small, consistent change
+        if (diff > 2 && diff < 15) {
+          noiseSum += diff;
+          samples++;
+        }
+      }
+    }
+  }
+  
+  return samples > 0 ? noiseSum / samples : 0;
+}
+
+// Sensitivity UI functions
+function createSensitivityUI() {
+  // Create UI container
+  sensitivityUI = createDiv('');
+  sensitivityUI.id('sensitivity-ui');
+  sensitivityUI.style('position', 'fixed');
+  sensitivityUI.style('top', '10px');
+  sensitivityUI.style('right', '10px');
+  sensitivityUI.style('background', 'rgba(0, 0, 0, 0.8)');
+  sensitivityUI.style('padding', '15px');
+  sensitivityUI.style('border-radius', '8px');
+  sensitivityUI.style('color', 'white');
+  sensitivityUI.style('font-family', 'monospace');
+  sensitivityUI.style('font-size', '12px');
+  sensitivityUI.style('min-width', '200px');
+  sensitivityUI.style('z-index', '1000');
+  
+  // Mode toggle button
+  modeButton = createButton('Auto Mode');
+  modeButton.parent(sensitivityUI);
+  modeButton.style('margin-bottom', '10px');
+  modeButton.style('width', '100%');
+  modeButton.style('background', '#4CAF50');
+  modeButton.style('color', 'white');
+  modeButton.style('border', 'none');
+  modeButton.style('padding', '8px');
+  modeButton.style('border-radius', '4px');
+  modeButton.style('cursor', 'pointer');
+  modeButton.mousePressed(() => {
+    sensitivityMode = sensitivityMode === 'auto' ? 'manual' : 'auto';
+    saveUserPreferences();
+    updateSensitivityDisplay();
+  });
+  
+  // Sensitivity slider
+  let sliderLabel = createDiv('Manual Sensitivity:');
+  sliderLabel.parent(sensitivityUI);
+  sliderLabel.style('margin-bottom', '5px');
+  
+  sensitivitySlider = createSlider(0, 1, userSensitivity, 0.01);
+  sensitivitySlider.parent(sensitivityUI);
+  sensitivitySlider.style('width', '100%');
+  sensitivitySlider.style('margin-bottom', '10px');
+  
+  sensitivitySlider.input(() => {
+    userSensitivity = sensitivitySlider.value();
+    if (sensitivityMode === 'manual') {
+      // Convert 0-1 range to threshold scale (inverted - higher slider = more sensitive)
+      thresholdScale = map(userSensitivity, 0, 1, 4.0, 0.5);
+    }
+    saveUserPreferences();
+    updateSensitivityDisplay();
+  });
+  
+  // Status display
+  statusDiv = createDiv('');
+  statusDiv.parent(sensitivityUI);
+  statusDiv.id('sensitivity-status');
+  
+  updateSensitivityDisplay();
+}
+
+function updateSensitivityDisplay() {
+  if (!sensitivityUI || !modeButton || !statusDiv) return;
+  
+  if (sensitivityMode === 'auto') {
+    modeButton.html('🤖 Auto Mode');
+    modeButton.style('background', '#4CAF50');
+    sensitivitySlider.attribute('disabled', true);
+    
+    if (isCalibrating) {
+      let progress = ((millis() - calibrationStartTime) / calibrationDuration * 100).toFixed(0);
+      statusDiv.html(`Calibrating... ${progress}%<br/>Please move naturally`);
+    } else {
+      statusDiv.html(`Auto Sensitivity: ${autoThresholdScale.toFixed(2)}<br/>Environment adapted`);
+    }
+  } else {
+    modeButton.html('👤 Manual Mode');
+    modeButton.style('background', '#FF9800');
+    sensitivitySlider.removeAttribute('disabled');
+    
+    let sensitivityLabel = userSensitivity < 0.3 ? 'Low' : userSensitivity < 0.7 ? 'Medium' : 'High';
+    statusDiv.html(`Manual: ${sensitivityLabel}<br/>Scale: ${thresholdScale.toFixed(2)}`);
+  }
+}
+
+function toggleSensitivityUI() {
+  if (!sensitivityUI) return;
+  
+  let currentDisplay = sensitivityUI.style('display');
+  if (currentDisplay === 'none') {
+    sensitivityUI.style('display', 'block');
+  } else {
+    sensitivityUI.style('display', 'none');
+  }
 }
 
 // Handle window resizing
