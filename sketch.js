@@ -11,10 +11,32 @@ let bgGradientTime = 0;
 let planetsBg = [];
 let nebulaBlobs = [];
 
+// Flow-field bodies (dust + planets)
+let bodies = [];
+let numSmallBodies = 320; // particle-like dust
+let numLargeBodies = 8;   // planetary sized bodies
+
+// Perlin flow field
+let flowFieldScale = 60; // grid cell size (px)
+let flowCols = 0;
+let flowRows = 0;
+let flowField = [];
+let flowZ = 0;         // time component for evolving field
+let flowZInc = 0.0025; // field evolution speed
+
+// Mouse attractor/repulsor pulse
+let attractor = { active: false, x: 0, y: 0, strength: 0, life: 0 };
+
+// Mouse motion dynamics (speed-based behavior)
+let mouseSpeedSmoothed = 0;
+let slowSpeedThreshold = 3;   // px/frame
+let fastSpeedThreshold = 12;  // px/frame
+let mouseInfluenceBaseRadius = 220; // pixels
+
 // Debug options
 let showMotionDebug = false; // Toggle motion visualization
 let showBaselineDiff = false; // Show baseline vs current frame difference
-let useHotspotAttraction = true; // Enable camera hotspots
+let useHotspotAttraction = false; // Camera hotspots disabled (we use mouse now)
 
 // Motion detection (adaptive baseline)
 let baselineFrame;
@@ -165,25 +187,21 @@ function setup() {
   canvas.parent('canvas-container');
   canvas.canvas.willReadFrequently = true;
   colorMode(HSB, 360, 255, 255); // HSB for simple color variation
-
-  // Initialize webcam
-  initializeCamera();
-
-  // Create simple particles
-  for (let i = 0; i < numParticles; i++) {
-    particles.push(new Particle(width/2, height/2));
+  // Custom cursor: hide system cursor and disable right-click menu on canvas
+  noCursor();
+  if (canvas && canvas.elt) {
+    canvas.elt.oncontextmenu = (e) => { e.preventDefault(); return false; };
   }
+
+  // Initialize flow field and bodies
+  initFlowField();
+  initBodies();
 
   // Initialize background elements
   initBackgroundElements();
 
-  // Load user preferences
-  loadUserPreferences();
-
-  // Create sensitivity UI
-  createSensitivityUI();
-
-  // Initialize motion detection map lazily when video is ready
+  // Initialize background elements
+  // (We keep these for a beautiful luminous scene)
 }
 
 // Removed background initialization - focusing on particles only
@@ -246,6 +264,26 @@ function hardClearCanvas() {
   // Reset any transforms before clearing
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, width, height);
+  pop();
+}
+
+// Custom cursor: soft nebula around the pointer
+function drawCustomCursor() {
+  const x = mouseX;
+  const y = mouseY;
+  if (x < 0 || y < 0 || x > width || y > height) return;
+  push();
+  noStroke();
+  const hue = (220 + 40 * sin(millis() * 0.0015)) % 360;
+  // outer glow
+  fill(hue, 120, 200, 24);
+  circle(x, y, 42);
+  // mid glow
+  fill((hue + 30) % 360, 160, 255, 40);
+  circle(x, y, 28);
+  // core
+  fill((hue + 60) % 360, 200, 255, 120);
+  circle(x, y, 8);
   pop();
 }
 
@@ -378,6 +416,165 @@ function drawNebulaBlobs() {
   pop();
 }
 
+// Flow field utilities
+function initFlowField() {
+  flowCols = ceil(width / flowFieldScale);
+  flowRows = ceil(height / flowFieldScale);
+  flowZ = random(1000);
+}
+
+function updateFlowField() {
+  flowZ += flowZInc;
+}
+
+function sampleFlowAt(x, y) {
+  const nx = x / flowFieldScale;
+  const ny = y / flowFieldScale;
+  const n = noise(nx, ny, flowZ);
+  const angle = n * TAU * 2.0; // broad directional variety
+  return p5.Vector.fromAngle(angle);
+}
+
+// Bodies system
+class Body {
+  constructor(x, y, isLarge = false) {
+    this.pos = createVector(x, y);
+    this.prev = this.pos.copy();
+    this.vel = p5.Vector.random2D().mult(0.5);
+    this.acc = createVector(0, 0);
+    this.isLarge = isLarge;
+    this.size = isLarge ? random(10, 26) : random(1.6, 3.4);
+    this.maxSpeed = isLarge ? random(0.8, 1.6) : random(1.8, 3.2);
+    this.maxForce = isLarge ? 0.035 : 0.065;
+    const baseHue = random([200, 220, 260, 300, 320]);
+    this.hue = (baseHue + random(-24, 24)) % 360;
+    this.alpha = isLarge ? 120 : 180;
+  }
+
+  applyForce(f) { this.acc.add(f); }
+
+  followFlow() {
+    const dir = sampleFlowAt(this.pos.x, this.pos.y);
+    const desired = p5.Vector.mult(dir, this.maxSpeed);
+    const steer = p5.Vector.sub(desired, this.vel).limit(this.maxForce);
+    this.applyForce(steer);
+  }
+
+  applyAttractor() {
+    if (!attractor.active || attractor.strength === 0) return;
+    const dx = attractor.x - this.pos.x;
+    const dy = attractor.y - this.pos.y;
+    const d = max(1, sqrt(dx * dx + dy * dy));
+    const radius = this.isLarge ? 280 : 200;
+    if (d > radius * 1.5) return;
+    const dir = createVector(dx / d, dy / d);
+    const t = 1 - min(d / radius, 1);
+    const falloff = t * t * (3 - 2 * t);
+    const influence = (this.isLarge ? 0.35 : 0.55) * attractor.strength;
+    const radial = p5.Vector.mult(dir, influence * falloff);
+    // Keep motion graceful: only a fraction of current speed redirected
+    this.applyForce(radial.limit(this.maxForce * 1.6));
+  }
+
+  applyMouseDynamics() {
+    // Influence radius expands slightly with speed for dramatic flings
+    const radius = mouseInfluenceBaseRadius * (1 + constrain((mouseSpeedSmoothed - slowSpeedThreshold) / (fastSpeedThreshold * 1.5), 0, 1));
+    const dx = mouseX - this.pos.x;
+    const dy = mouseY - this.pos.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 === 0) return;
+    const d = sqrt(d2);
+    if (d > radius) return;
+
+    const dir = createVector(dx / d, dy / d);
+    const t = 1 - min(d / radius, 1);
+    const falloff = t * t * (3 - 2 * t);
+
+    if (mouseSpeedSmoothed <= slowSpeedThreshold) {
+      // Slow movement: gentle attraction like guiding dust
+      const k = this.isLarge ? 0.04 : 0.08;
+      const f = p5.Vector.mult(dir, k * falloff);
+      this.applyForce(f.limit(this.maxForce));
+    } else if (mouseSpeedSmoothed >= fastSpeedThreshold) {
+      // Fast movement: fling away (repulsive impulse) proportional to speed
+      const repelStrength = map(mouseSpeedSmoothed, fastSpeedThreshold, fastSpeedThreshold * 2.5, 0.6, 1.8, true);
+      const away = p5.Vector.mult(dir, -repelStrength * falloff);
+      this.applyForce(away.limit(this.maxForce * 3));
+    } else {
+      // Mid range: mostly follow with slight outward turbulence
+      const followFactor = map(mouseSpeedSmoothed, slowSpeedThreshold, fastSpeedThreshold, 0.08, 0.02, true);
+      const f = p5.Vector.mult(dir, followFactor * falloff);
+      const jitter = p5.Vector.random2D().mult(0.04 * falloff);
+      f.add(jitter);
+      this.applyForce(f.limit(this.maxForce * 1.2));
+    }
+  }
+
+  update() {
+    this.prev.set(this.pos);
+    // Gentle per-body noise drift for living feel
+    const jitter = noise(this.pos.x * 0.005, this.pos.y * 0.005, frameCount * 0.01) - 0.5;
+    this.applyForce(p5.Vector.random2D().mult(jitter * (this.isLarge ? 0.02 : 0.04)));
+
+    this.vel.add(this.acc);
+    this.vel.limit(this.maxSpeed);
+    this.pos.add(this.vel);
+    this.acc.mult(0);
+  }
+
+  display() {
+    if (this.isLarge) {
+      noStroke();
+      // soft glow
+      fill(this.hue, 140, 220, 26);
+      circle(this.pos.x, this.pos.y, this.size * 3.2);
+      fill(this.hue, 160, 240, 46);
+      circle(this.pos.x, this.pos.y, this.size * 2.2);
+      // core
+      fill(this.hue, 180, 255, 120);
+      circle(this.pos.x, this.pos.y, this.size);
+      // subtle ring
+      stroke(this.hue, 120, 220, 40);
+      strokeWeight(1);
+      noFill();
+      rotate(0);
+      ellipse(this.pos.x, this.pos.y, this.size * 2.8, this.size * 1.4);
+    } else {
+      // dust glow
+      noStroke();
+      fill(this.hue, 140, 255, 24);
+      circle(this.pos.x, this.pos.y, this.size * 2.0);
+      fill(this.hue, 180, 255, this.alpha);
+      circle(this.pos.x, this.pos.y, this.size);
+    }
+  }
+
+  isOffscreen() {
+    const m = 12;
+    return this.pos.x < -m || this.pos.x > width + m || this.pos.y < -m || this.pos.y > height + m;
+  }
+}
+
+function spawnBody(isLarge = false) {
+  const edge = floor(random(4));
+  let x, y;
+  if (edge === 0) { x = random(width); y = -10; }
+  else if (edge === 1) { x = width + 10; y = random(height); }
+  else if (edge === 2) { x = random(width); y = height + 10; }
+  else { x = -10; y = random(height); }
+  const b = new Body(x, y, isLarge);
+  // Nudge along local flow so it enters nicely
+  const dir = sampleFlowAt(x, y);
+  b.vel = dir.mult(b.maxSpeed * random(0.6, 1.0));
+  return b;
+}
+
+function initBodies() {
+  bodies = [];
+  for (let i = 0; i < numSmallBodies; i++) bodies.push(spawnBody(false));
+  for (let i = 0; i < numLargeBodies; i++) bodies.push(spawnBody(true));
+}
+
 function initializeCamera() {
   
   
@@ -491,179 +688,85 @@ function videoSuccess(stream) {
 }
 
 function draw() {
-  // Draw camera feed as background if available
-  if (videoReady && videoCapture) {
-    // Scale and draw the camera feed to fit the canvas
-    push();
-    tint(255, 255, 255, 22); // Keep camera extremely subtle behind visuals
-    
-    // Calculate scaling to fit camera feed to canvas while maintaining aspect ratio
-    let videoAspect = videoCapture.width / videoCapture.height;
-    let canvasAspect = width / height;
-    
-    let drawWidth, drawHeight, drawX, drawY;
-    
-    if (videoAspect > canvasAspect) {
-      // Video is wider than canvas
-      drawHeight = height;
-      drawWidth = height * videoAspect;
-      drawX = (width - drawWidth) / 2;
-      drawY = 0;
-    } else {
-      // Video is taller than canvas
-      drawWidth = width;
-      drawHeight = width / videoAspect;
-      drawX = 0;
-      drawY = (height - drawHeight) / 2;
-    }
-    
-    // Mirror horizontally by drawing with negative width
-    push();
-    translate(drawX + drawWidth, 0);
-    scale(-1, 1);
-    // image(videoCapture, 0, drawY, drawWidth, drawHeight);
-    pop();
-    pop();
-  } else {
-    // Fallback to black background if no camera
-    background(0);
-  }
-  // background(0);
-
-  // Hard clear to fully remove any previous frame content (prevents lingering trails)
+  // Clear frame fully
   hardClearCanvas();
 
-  // Dynamic space background layers (always behind particles)
-  blendMode(BLEND); // ensure normal compositing for background paint
+  // Space background
+  blendMode(BLEND);
   drawBackgroundGradient();
-  if (!showMotionDebug) {
-    drawBackgroundPlanets();
-    drawNebulaBlobs();
-  }
+  drawBackgroundPlanets();
+  drawNebulaBlobs();
 
-  // Throttle baseline adaption to reduce per-frame cost
-  if (videoReady && videoCapture && frameCount > 60 && frameCount % 10 === 0) { // ~6 Hz
-    updateAdaptiveBaseline();
-  }
+  // Update flow field
+  updateFlowField();
 
-  // Update auto-calibration if running
-  if (isCalibrating) {
-    updateAutoCalibration();
-    updateSensitivityDisplay(); // Update UI during calibration
-  }
+  // Update smoothed mouse speed
+  const dx = (movedX || 0);
+  const dy = (movedY || 0);
+  const instSpeed = sqrt(dx * dx + dy * dy);
+  mouseSpeedSmoothed = lerp(mouseSpeedSmoothed, instSpeed, 0.15);
 
-  // Process motion detection only when needed (debug or attraction) and throttled
-  if (videoReady && videoCapture && (showMotionDebug || useHotspotAttraction || isCalibrating)) {
-    const detectEvery = showMotionDebug ? detectionIntervalDebug : detectionIntervalHotspot;
-    const sampleStep = showMotionDebug ? detectionStepDebug : detectionStepHotspot;
-    if (frameCount % detectEvery === 0) {
-      detectMotion(sampleStep);
-    }
-    // calculateMotionVectors();
-
-    // Debug logging every 30 frames (about 0.5 second at 60fps)
-    if (frameCount % 30 === 0) {
-      
-    }
-  }
-
-  // Show motion detection debug if enabled
-  if (showMotionDebug) {
-    if (showBaselineDiff) {
-      if (frameCount % 4 === 0) drawBaselineDifference();
+  // Update attractor pulse
+  if (attractor.active) {
+    if (!mouseIsPressed) {
+      attractor.life = max(0, attractor.life - 1);
+      if (attractor.life === 0) attractor.active = false;
+      attractor.strength *= 0.96;
+      if (abs(attractor.strength) < 0.02) attractor.strength = 0;
     } else {
-      if (frameCount % 4 === 0) drawMotionDebug();
-      drawMotionHotspots();
-      // drawMotionVectors();
+      attractor.x = mouseX;
+      attractor.y = mouseY;
     }
   }
 
-  // Core particle system
+  // Bodies update/render
   push();
-  blendMode(ADD); // Make particles glow over background
-  for (let particle of particles) {
-    particle.flock(particles);             // Flocking behavior
-    if (useHotspotAttraction && (frameCount + (particle.pos.x | 0)) % hotspotUpdateModulo === 0) {
-      particle.applyHotspotAttractionFast();
+  blendMode(ADD);
+  for (let i = bodies.length - 1; i >= 0; i--) {
+    let b = bodies[i];
+    b.followFlow();
+    b.applyMouseDynamics();
+    b.applyAttractor();
+    b.update();
+    b.display();
+    if (b.isOffscreen()) {
+      bodies.splice(i, 1);
+      bodies.push(spawnBody(b.isLarge));
     }
-    particle.update();
-    particle.display();
   }
   pop();
 
-  // Show camera status and instructions
+  // Custom nebulous cursor
+  drawCustomCursor();
+
   drawInstructions();
 }
 
-// Mouse click to add a particle for testing
+// Mouse interaction: left click = attract, right click = repel
 function mousePressed() {
-  particles.push(new Particle(mouseX, mouseY));
+  attractor.active = true;
+  attractor.x = mouseX;
+  attractor.y = mouseY;
+  const isRight = mouseButton === RIGHT;
+  const isMiddle = mouseButton === CENTER;
+  attractor.strength = (isRight || isMiddle) ? -1 : 1; // negative = repulse
+  attractor.life = 60; // frames to linger
+  return false; // prevent default context menu on right click in some hosts
+}
+
+function mouseReleased() {
+  // Let the pulse fade instead of hard stop
+  attractor.life = 30;
 }
 
 // Keyboard controls for debugging
 function keyPressed() {
-  if (key === 'r' || key === 'R') {
-    // Retry camera initialization
-    
-    retryCamera();
-  } else if (key === 'c' || key === 'C') {
-    // Clear all particles
-    particles = [];
+  if (key === 'c' || key === 'C') {
+    // Re-initialize bodies
+    initBodies();
   } else if (key === ' ') {
-    // Add random particle
-    particles.push(new Particle(random(width), random(height)));
-  } else if (key === 'd' || key === 'D') {
-    // Toggle motion debug visualization
-    showMotionDebug = !showMotionDebug;
-    if (!showMotionDebug) {
-      cleanupAfterDebug();
-    }
-  } else if (key === 'f' || key === 'F') {
-    // Toggle baseline difference view
-    if (showMotionDebug) {
-      showBaselineDiff = !showBaselineDiff;
-      
-    }
-  } else if (key === 'b' || key === 'B') {
-    // Force update baseline frame
-    updateBaselineFrame();
-    
-  } else if (key === '1') {
-    // Slower baseline adaptation
-    baselineUpdateRate = max(0.001, baselineUpdateRate * 0.5);
-    
-  } else if (key === '2') {
-    // Faster baseline adaptation
-    baselineUpdateRate = min(0.02, baselineUpdateRate * 2);
-    
-  } else if (key === '-' || key === '_') {
-    // Raise threshold (less sensitive)
-    thresholdScale = min(5.0, thresholdScale * 1.15);
-  } else if (key === '=' || key === '+') {
-    // Lower threshold (more sensitive)
-    thresholdScale = max(0.2, thresholdScale / 1.15);
-  } else if (key === 'h' || key === 'H') {
-    useHotspotAttraction = !useHotspotAttraction;
-  } else if (key === 'a' || key === 'A') {
-    // Toggle between auto and manual sensitivity
-    sensitivityMode = sensitivityMode === 'auto' ? 'manual' : 'auto';
-    saveUserPreferences();
-    updateSensitivityDisplay();
-  } else if (key === 's' || key === 'S') {
-    // Toggle sensitivity UI visibility
-    toggleSensitivityUI();
-  } else if (key === 'q' || key === 'Q') {
-    // Decrease hotspot speed damping (less slowdown)
-    hotspotSpeedDamping = max(0, hotspotSpeedDamping - 0.05);
-    console.log(`Hotspot speed damping: ${hotspotSpeedDamping.toFixed(2)}`);
-  } else if (key === 'w' || key === 'W') {
-    // Increase hotspot speed damping (more slowdown)
-    hotspotSpeedDamping = min(0.8, hotspotSpeedDamping + 0.05);
-    console.log(`Hotspot speed damping: ${hotspotSpeedDamping.toFixed(2)}`);
-  } else if (key === 'e' || key === 'E') {
-    // Adjust core speed limit
-    hotspotCoreSpeedLimit = hotspotCoreSpeedLimit > 1 ? max(0.5, hotspotCoreSpeedLimit - 0.2) : min(3, hotspotCoreSpeedLimit + 0.2);
-    console.log(`Hotspot core speed limit: ${hotspotCoreSpeedLimit.toFixed(1)}`);
+    // Spawn a large body at mouse
+    bodies.push(new Body(mouseX, mouseY, true));
   }
 }
 
@@ -1493,57 +1596,18 @@ function drawInstructions() {
   textAlign(LEFT);
   textSize(12);
   
-  // Camera status
+  // Controls & info
   fill(255);
-  if (videoReady && videoCapture) {
-    fill(0, 255, 0); // Green for camera working
-    text("📹 Camera: ACTIVE", 10, 25);
-    fill(255);
-    text(`Video: ${videoCapture.width}x${videoCapture.height}`, 10, 45);
-  } else if (cameraError) {
-    fill(255, 0, 0); // Red for error
-    text("📹 Camera: ERROR - " + cameraError, 10, 25);
-  } else {
-    fill(255, 255, 0); // Yellow for loading
-    text("📹 Camera: LOADING...", 10, 25);
-  }
-  
-  // Controls
-  fill(255);
-  textAlign(CENTER);
-  text("Controls: D debug • F diff • B baseline • 1/2 baseline speed • +/- sensitivity • H hotspot • Q/W damping • E core speed • A auto/manual • S show/hide UI • C clear • R retry cam", width / 2, height - 20);
-  
-  // Performance info and motion stats
+  textAlign(LEFT);
+  text("Mouse: Left = attract • Right/Middle = repel", 10, 22);
+  text("Speed: slow = follow • fast = fling", 10, 40);
+  text("Space: spawn large body • C: re-seed bodies", 10, 58);
+
+  // Performance info
   textAlign(RIGHT);
   fill(200);
-  text(`FPS: ${nf(frameRate(), 0, 1)} | Particles: ${particles.length}`, width - 10, 25);
-  
-  // Auto-calibration status
-  if (isCalibrating) {
-    fill(255, 255, 0);
-    let progress = ((millis() - calibrationStartTime) / calibrationDuration * 100).toFixed(0);
-    text(`🎯 Auto-calibrating... ${progress}%`, width - 10, 45);
-  } else if (sensitivityMode === 'auto') {
-    fill(0, 255, 0);
-    text(`🤖 Auto-sensitivity: ${autoThresholdScale.toFixed(2)}`, width - 10, 45);
-  } else {
-    fill(255, 165, 0);
-    text(`👤 Manual sensitivity: ${thresholdScale.toFixed(2)}`, width - 10, 45);
-  }
-  
-  if (showMotionDebug) {
-    fill(120, 255, 120);
-    let debugMode = showBaselineDiff ? "BASELINE DIFF" : "MOTION PIXELS";
-    text(`${debugMode} | Hotspots: ${motionHotspots.length}`, width - 10, 65);
-    fill(200);
-    text(`Baseline rate: ${(baselineUpdateRate * 1000).toFixed(1)}/1000`, width - 10, 85);
-    text(`Speed damping: ${(hotspotSpeedDamping * 100).toFixed(0)}% | Core limit: ${hotspotCoreSpeedLimit.toFixed(1)}`, width - 10, 105);
-    if (showBaselineDiff) {
-      text("⚫ Grayscale: Frame difference | 🟢 Green: Hotspots", width - 10, 125);
-    } else {
-      text("🔴 Red: Motion pixels | 🟢 Green: Hotspots", width - 10, 125);
-    }
-  }
+  text(`FPS: ${nf(frameRate(), 0, 1)} | Bodies: ${bodies.length}`, width - 10, 22);
+  text(`Mouse speed: ${mouseSpeedSmoothed.toFixed(1)} | Flow z: ${flowZ.toFixed(2)}`, width - 10, 40);
   
   pop();
 }
@@ -1789,16 +1853,8 @@ function toggleSensitivityUI() {
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
 
-  // Reinitialize motion detection
-  // Do NOT recreate baselineFrame here (keep video resolution). Just clear motion buffer.
-  motionPixels = new Array(width * height).fill(0);
-
-  // Reset particles to new canvas size
-  particles = [];
-  for (let i = 0; i < numParticles; i++) {
-    particles.push(new Particle(random(width), random(height)));
-  }
-
-  // Recreate background elements so sizes follow new viewport
+  // Recreate background and flow field
   initBackgroundElements();
+  initFlowField();
+  initBodies();
 }
